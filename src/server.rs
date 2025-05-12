@@ -1,6 +1,5 @@
-// src/server.rs
 use tokio::net::TcpListener;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use crate::storage::Storage;
@@ -64,19 +63,18 @@ async fn handle_client(
     storage: Arc<Mutex<Storage>>,
     clients: Arc<Mutex<HashMap<Uuid, mpsc::Sender<ServerResponse>>>>,
 ) -> Result<()> {
-    let (mut socket_read, mut socket_write) = tokio::io::split(socket);
-    let mut buf = [0; 1024];
+    let (reader, mut socket_write) = tokio::io::split(socket);
+    let mut reader = BufReader::new(reader); // Use BufReader for line-based reading
     let (tx, mut rx) = mpsc::channel::<ServerResponse>(100);
 
+    // Task to write responses to the socket
     tokio::spawn(async move {
         while let Some(response) = rx.recv().await {
-            if socket_write
-                .write_all(serde_json::to_string(&response)?.as_bytes())
-                .await
-                .is_err()
-            {
-                break;
-            }
+            let response_json = serde_json::to_string(&response)?;
+            // Write JSON response followed by newline
+            socket_write.write_all(response_json.as_bytes()).await?;
+            socket_write.write_all(b"\n").await?;
+            socket_write.flush().await?; // Ensure response is sent
         }
         Ok::<(), anyhow::Error>(())
     });
@@ -89,9 +87,11 @@ async fn handle_client(
 
     let mut user_id: Option<Uuid> = None;
     let mut authenticated = false;
+    let mut line = String::new();
 
     loop {
-        match socket_read.read(&mut buf).await {
+        line.clear();
+        match reader.read_line(&mut line).await {
             Ok(0) => {
                 println!("Connection closed");
                 if let Some(id) = user_id {
@@ -99,10 +99,10 @@ async fn handle_client(
                 }
                 break;
             }
-            Ok(n) => {
-                let data = String::from_utf8_lossy(&buf[..n]);
-                if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&data) {
-                    let storage = storage.lock().await; // Убрано mut
+            Ok(_) => {
+                println!("Received: {}", line); // Debug: log raw client message
+                if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&line) {
+                    let storage = storage.lock().await;
                     match client_msg {
                         ClientMessage::Register { username, public_key } => {
                             let user = User {
@@ -116,11 +116,17 @@ async fn handle_client(
                                     authenticated = true;
                                     let mut clients = clients.lock().await;
                                     clients.insert(user.id, tx.clone());
-                                    tx.send(ServerResponse::Success(format!("Registered and logged in as {}", username)))
+                                    tx.send(ServerResponse::Success(format!(
+                                        "Registered and logged in as {}",
+                                        username
+                                    )))
                                         .await?;
                                 }
                                 Err(e) => {
-                                    tx.send(ServerResponse::Error(format!("Registration failed: {}", e)))
+                                    tx.send(ServerResponse::Error(format!(
+                                        "Registration failed: {}",
+                                        e
+                                    )))
                                         .await?;
                                 }
                             }
@@ -132,11 +138,16 @@ async fn handle_client(
                                     authenticated = true;
                                     let mut clients = clients.lock().await;
                                     clients.insert(user.id, tx.clone());
-                                    tx.send(ServerResponse::Success(format!("Logged in as {}", username)))
+                                    tx.send(ServerResponse::Success(format!(
+                                        "Logged in as {}",
+                                        username
+                                    )))
                                         .await?;
                                 }
                                 Ok(_) => {
-                                    tx.send(ServerResponse::Error("Invalid public key".to_string()))
+                                    tx.send(ServerResponse::Error(
+                                        "Invalid public key".to_string(),
+                                    ))
                                         .await?;
                                 }
                                 Err(_) => {
@@ -147,7 +158,9 @@ async fn handle_client(
                         }
                         ClientMessage::Text(msg) => {
                             if !authenticated {
-                                tx.send(ServerResponse::Error("Not authenticated".to_string()))
+                                tx.send(ServerResponse::Error(
+                                    "Not authenticated".to_string(),
+                                ))
                                     .await?;
                                 continue;
                             }
@@ -156,7 +169,9 @@ async fn handle_client(
                         }
                     }
                 } else {
-                    tx.send(ServerResponse::Error("Invalid message format".to_string()))
+                    tx.send(ServerResponse::Error(
+                        "Invalid message format".to_string(),
+                    ))
                         .await?;
                 }
             }

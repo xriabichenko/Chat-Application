@@ -1,14 +1,16 @@
-// src/bin/client.rs
 use chat_application::models::Message;
 use chat_application::crypto::Crypto;
 use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use anyhow::Result;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use std::env;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tokio::time::{sleep, Duration};
 
 #[derive(Serialize, Deserialize)]
 enum ClientMessage {
@@ -25,41 +27,67 @@ enum ServerResponse {
     Message(Message),
 }
 
+// Shared state for authentication
+struct ClientState {
+    authenticated: bool,
+    user_id: Option<Uuid>,
+}
+
 pub async fn run_client(addr: &str) -> Result<()> {
     let stream = TcpStream::connect(addr).await?;
     println!("Connected to {}", addr);
 
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (reader, mut writer) = tokio::io::split(stream);
     let crypto = Crypto::new();
-    let crypto_clone = crypto.clone(); // Клонируем для использования в замыкании
+    let crypto_clone = crypto.clone();
     let key = [0u8; 32]; // Dummy key for testing
-    let mut user_id: Option<Uuid> = None;
-    let mut authenticated = false;
+
+    // Shared state
+    let state = Arc::new(Mutex::new(ClientState {
+        authenticated: false,
+        user_id: None,
+    }));
+    let state_clone = Arc::clone(&state);
 
     // Spawn a task to read server responses
     tokio::spawn(async move {
-        let mut buf = [0; 1024];
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+
         loop {
-            match reader.read(&mut buf).await {
+            line.clear();
+            match reader.read_line(&mut line).await {
                 Ok(0) => {
                     println!("Server disconnected");
                     break;
                 }
                 Ok(n) => {
-                    let response = String::from_utf8_lossy(&buf[..n]);
-                    if let Ok(server_response) = serde_json::from_str::<ServerResponse>(&response) {
+                    println!("Raw server response ({} bytes): '{}'", n, line);
+                    if let Ok(server_response) = serde_json::from_str::<ServerResponse>(&line) {
                         match server_response {
-                            ServerResponse::Prompt(msg) => println!("{}", msg),
-                            ServerResponse::Success(msg) => println!("Success: {}", msg),
-                            ServerResponse::Error(msg) => println!("Error: {}", msg),
+                            ServerResponse::Prompt(msg) => println!("Prompt: {}", msg),
+                            ServerResponse::Success(msg) => {
+                                println!("Success: {}", msg);
+                                let mut state = state_clone.lock().await;
+                                state.authenticated = true;
+                                state.user_id = Some(Uuid::new_v4());
+                            }
+                            ServerResponse::Error(msg) => {
+                                println!("Error: {}. Please try again.", msg);
+                            }
                             ServerResponse::Message(msg) => {
-                                let decoded = STANDARD.decode(&msg.content).map_err(|e| anyhow::anyhow!("Base64 decode error: {}", e))?;
+                                let decoded = STANDARD
+                                    .decode(&msg.content)
+                                    .map_err(|e| anyhow::anyhow!("Base64 decode error: {}", e))?;
                                 let decrypted = crypto_clone.decrypt(&key, &decoded)?;
-                                println!("Received message: {}", String::from_utf8_lossy(&decrypted));
+                                println!(
+                                    "Received message: {}",
+                                    String::from_utf8_lossy(&decrypted)
+                                );
                             }
                         }
                     } else {
-                        println!("Invalid response: {}", response);
+                        println!("Invalid response: {}", line);
                     }
                 }
                 Err(e) => {
@@ -97,6 +125,11 @@ pub async fn run_client(addr: &str) -> Result<()> {
             continue;
         }
 
+        let state = state.lock().await;
+        let authenticated = state.authenticated;
+        let user_id = state.user_id;
+        drop(state);
+
         let msg = match parts[0].to_lowercase().as_str() {
             "register" if parts.len() >= 3 => {
                 let username = parts[1].to_string();
@@ -125,20 +158,15 @@ pub async fn run_client(addr: &str) -> Result<()> {
             }
         };
 
-        writer.write_all(serde_json::to_string(&msg)?.as_bytes()).await?;
+        let msg_json = serde_json::to_string(&msg)?;
+        println!("Sending: {}", msg_json);
+        writer.write_all(msg_json.as_bytes()).await?;
         writer.write_all(b"\n").await?;
+        writer.flush().await?;
 
-        // Update authentication status based on response
+        // Brief delay to allow server response
         if matches!(msg, ClientMessage::Register { .. } | ClientMessage::Login { .. }) {
-            let mut buf = [0; 1024];
-            let n = reader.read(&mut buf).await?;
-            let response = String::from_utf8_lossy(&buf[..n]);
-            if let Ok(server_response) = serde_json::from_str::<ServerResponse>(&response) {
-                if let ServerResponse::Success(_) = server_response {
-                    authenticated = true;
-                    user_id = Some(Uuid::new_v4()); // Simplified; server should return user_id
-                }
-            }
+            sleep(Duration::from_millis(100)).await;
         }
     }
 
