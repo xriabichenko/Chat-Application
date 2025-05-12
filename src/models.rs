@@ -12,8 +12,9 @@ pub struct User {
 pub struct Message {
     pub id: Uuid,
     pub sender_id: Uuid,
+    pub receiver_id: Option<Uuid>,
     pub group_id: Option<Uuid>,
-    pub content: String, // Encrypted
+    pub content: String,
     pub timestamp: i64,
 }
 

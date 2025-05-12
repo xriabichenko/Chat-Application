@@ -19,12 +19,13 @@ impl Storage {
         )?;
         conn.execute(
             "CREATE TABLE IF NOT EXISTS messages (
-                id TEXT PRIMARY KEY,
-                sender_id TEXT NOT NULL,
-                group_id TEXT,
-                content TEXT NOT NULL,
-                timestamp INTEGER NOT NULL
-            )",
+        id TEXT PRIMARY KEY,
+        sender_id TEXT NOT NULL,
+        receiver_id TEXT,  -- Новое поле
+        group_id TEXT,
+        content TEXT NOT NULL,
+        timestamp INTEGER NOT NULL
+    )",
             [],
         )?;
         Ok(Storage { conn })
@@ -52,10 +53,11 @@ impl Storage {
 
     pub fn save_message(&self, msg: &Message) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO messages (id, sender_id, group_id, content, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO messages (id, sender_id, receiver_id, group_id, content, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             (
                 &msg.id.to_string(),
                 &msg.sender_id.to_string(),
+                &msg.receiver_id.map(|id| id.to_string()),
                 &msg.group_id.map(|id| id.to_string()),
                 &msg.content,
                 &msg.timestamp,

@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [[bin]]
 name = "client"
-path = "src/client.rs"
+path = "src/bin/client.rs"
 
 [dependencies]
 tokio = { version = "1.40", features = ["full"] }
@@ -25,3 +25,5 @@ log = "0.4"
 env_logger = "0.11"
 anyhow = "1.0"
 chrono = "0.4"
+tokio-tungstenite = "0.20"
+futures-util = "0.3"

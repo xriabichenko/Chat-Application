@@ -6,13 +6,12 @@ mod models;
 mod crypto;
 mod storage;
 mod server;
-mod client;
-
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
     env_logger::init();
+
+
 
     let db_path = env::var("DATABASE_URL").unwrap_or("./chat.db".to_string());
     let server_addr = env::var("SERVER_PORT").unwrap_or("127.0.0.1:8080".to_string());
