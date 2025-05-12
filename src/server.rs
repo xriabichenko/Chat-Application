@@ -3,7 +3,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use crate::storage::Storage;
-use crate::models::{Message, User};
+use crate::models::{Message, User, Group};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use std::collections::HashMap;
@@ -14,12 +14,15 @@ enum ClientMessage {
     Register { username: String, public_key: String },
     Login { username: String, public_key: String },
     Text(Message),
+    Send { receiver_username: String, message: Message },
+    CreateGroup { group_name: String, member_usernames: Vec<String> }, // Создание группы
+    SendToGroup { group_id: Uuid, message: Message },
 }
 
 #[derive(Serialize, Deserialize)]
 enum ServerResponse {
     Prompt(String),
-    Success(String),
+    Success { message: String, user_id: Uuid },
     Error(String),
     Message(Message),
 }
@@ -64,24 +67,22 @@ async fn handle_client(
     clients: Arc<Mutex<HashMap<Uuid, mpsc::Sender<ServerResponse>>>>,
 ) -> Result<()> {
     let (reader, mut socket_write) = tokio::io::split(socket);
-    let mut reader = BufReader::new(reader); // Use BufReader for line-based reading
+    let mut reader = BufReader::new(reader);
     let (tx, mut rx) = mpsc::channel::<ServerResponse>(100);
 
-    // Task to write responses to the socket
     tokio::spawn(async move {
         while let Some(response) = rx.recv().await {
             let response_json = serde_json::to_string(&response)?;
-            // Write JSON response followed by newline
+            println!("Sending to client: {}", response_json); // Debug: log sent response
             socket_write.write_all(response_json.as_bytes()).await?;
             socket_write.write_all(b"\n").await?;
-            socket_write.flush().await?; // Ensure response is sent
+            socket_write.flush().await?;
         }
         Ok::<(), anyhow::Error>(())
     });
 
-    // Send login/register prompt
     tx.send(ServerResponse::Prompt(
-        "Please send 'login <username> <public_key>' or 'register <username> <public_key>'".to_string(),
+        "Please send 'login <username> <public_key>', 'register <username> <public_key>', 'send <username> <message>', 'create_group <group_name> <username1> <username2> ...', or 'send_group <group_id> <message>'".to_string(),
     ))
         .await?;
 
@@ -93,18 +94,18 @@ async fn handle_client(
         line.clear();
         match reader.read_line(&mut line).await {
             Ok(0) => {
-                println!("Connection closed");
+                println!("Connection closed for user {:?}", user_id);
                 if let Some(id) = user_id {
                     clients.lock().await.remove(&id);
                 }
                 break;
             }
             Ok(_) => {
-                println!("Received: {}", line); // Debug: log raw client message
+                println!("Received from user {:?}: {}", user_id, line);
                 if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&line) {
-                    let storage = storage.lock().await;
                     match client_msg {
                         ClientMessage::Register { username, public_key } => {
+                            let mut storage = storage.lock().await;
                             let user = User {
                                 id: Uuid::new_v4(),
                                 username: username.clone(),
@@ -116,10 +117,10 @@ async fn handle_client(
                                     authenticated = true;
                                     let mut clients = clients.lock().await;
                                     clients.insert(user.id, tx.clone());
-                                    tx.send(ServerResponse::Success(format!(
-                                        "Registered and logged in as {}",
-                                        username
-                                    )))
+                                    tx.send(ServerResponse::Success {
+                                        message: format!("Registered and logged in as {}", username),
+                                        user_id: user.id,
+                                    })
                                         .await?;
                                 }
                                 Err(e) => {
@@ -132,17 +133,18 @@ async fn handle_client(
                             }
                         }
                         ClientMessage::Login { username, public_key } => {
+                            let storage = storage.lock().await;
                             match storage.get_user_by_username(&username) {
                                 Ok(user) if user.public_key == public_key => {
                                     user_id = Some(user.id);
                                     authenticated = true;
                                     let mut clients = clients.lock().await;
                                     clients.insert(user.id, tx.clone());
-                                    tx.send(ServerResponse::Success(format!(
-                                        "Logged in as {}",
-                                        username
-                                    )))
-                                        .await?;
+                                    let response = ServerResponse::Success {
+                                        message: format!("Logged in as {}", username),
+                                        user_id: user.id,
+                                    };
+                                    tx.send(response).await?;
                                 }
                                 Ok(_) => {
                                     tx.send(ServerResponse::Error(
@@ -164,8 +166,128 @@ async fn handle_client(
                                     .await?;
                                 continue;
                             }
+                            if user_id != Some(msg.sender_id) {
+                                tx.send(ServerResponse::Error(
+                                    "Invalid sender_id".to_string(),
+                                ))
+                                    .await?;
+                                continue;
+                            }
+                            let storage = storage.lock().await;
                             storage.save_message(&msg)?;
                             tx.send(ServerResponse::Message(msg.clone())).await?;
+                        }
+                        ClientMessage::Send { receiver_username, mut message } => {
+                            if !authenticated {
+                                tx.send(ServerResponse::Error(
+                                    "Not authenticated".to_string(),
+                                ))
+                                    .await?;
+                                continue;
+                            }
+                            if user_id != Some(message.sender_id) {
+                                tx.send(ServerResponse::Error(
+                                    "Invalid sender_id".to_string(),
+                                ))
+                                    .await?;
+                                continue;
+                            }
+                            let storage = storage.lock().await;
+                            match storage.get_user_by_username(&receiver_username) {
+                                Ok(receiver) => {
+                                    message.receiver_id = Some(receiver.id);
+                                    storage.save_message(&message)?;
+                                    let clients = clients.lock().await;
+                                    if let Some(receiver_tx) = clients.get(&receiver.id) {
+                                        receiver_tx
+                                            .send(ServerResponse::Message(message.clone()))
+                                            .await?;
+                                        tx.send(ServerResponse::Success {
+                                            message: format!("Message sent to {}", receiver_username),
+                                            user_id: receiver.id,
+                                        })
+                                            .await?;
+                                    } else {
+                                        tx.send(ServerResponse::Error(
+                                            "Recipient is offline".to_string(),
+                                        ))
+                                            .await?;
+                                    }
+                                }
+                                Err(_) => {
+                                    tx.send(ServerResponse::Error(
+                                        "Recipient not found".to_string(),
+                                    ))
+                                        .await?;
+                                }
+                            }
+                        }
+                        ClientMessage::CreateGroup { group_name, member_usernames } => {
+                            if !authenticated {
+                                tx.send(ServerResponse::Error("Not authenticated".to_string())).await?;
+                                continue;
+                            }
+                            let mut storage = storage.lock().await;
+                            let mut members = vec![user_id.unwrap()];
+
+                            // Найти ID пользователей по именам
+                            for username in member_usernames {
+                                match storage.get_user_by_username(&username) {
+                                    Ok(user) => members.push(user.id),
+                                    Err(_) => {
+                                        tx.send(ServerResponse::Error(format!("User {} not found", username))).await?;
+                                        continue;
+                                    }
+                                }
+                            }
+                            // Создать группу
+                            let group = Group {
+                                id: Uuid::new_v4(),
+                                name: group_name,
+                                members,
+                            };
+                            storage.save_group(&group)?;
+
+                            tx.send(ServerResponse::Success {
+                                message: format!("Group {} created with {} members (group_id: {})", group.name, group.members.len(), group.id),
+                                user_id: user_id.unwrap(),
+                            }).await?;
+                        }
+                        ClientMessage::SendToGroup { group_id, mut message } => {
+                            if !authenticated {
+                                tx.send(ServerResponse::Error("Not authenticated".to_string())).await?;
+                                continue;
+                            }
+                            if user_id != Some(message.sender_id) {
+                                tx.send(ServerResponse::Error("Invalid sender_id".to_string())).await?;
+                                continue;
+                            }
+
+                            let storage = storage.lock().await;
+                            match storage.get_group_by_id(&group_id) {
+                                Ok(group) => {
+                                    if !group.members.contains(&message.sender_id) {
+                                        tx.send(ServerResponse::Error("You are not a member of this group".to_string())).await?;
+                                        continue;
+                                    }
+                                    message.group_id = Some(group_id);
+                                    storage.save_message(&message)?;
+
+                                    let clients = clients.lock().await;
+                                    for member_id in group.members {
+                                        if let Some(member_tx) = clients.get(&member_id) {
+                                            member_tx.send(ServerResponse::Message(message.clone())).await?;
+                                        }
+                                    }
+                                    tx.send(ServerResponse::Success {
+                                        message: format!("Message sent to group {}", group_id),
+                                        user_id: user_id.unwrap(),
+                                    }).await?;
+                                }
+                                Err(_) => {
+                                    tx.send(ServerResponse::Error("Group not found".to_string())).await?;
+                                }
+                            }
                         }
                     }
                 } else {

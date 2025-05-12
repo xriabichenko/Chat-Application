@@ -17,12 +17,15 @@ enum ClientMessage {
     Register { username: String, public_key: String },
     Login { username: String, public_key: String },
     Text(Message),
+    Send { receiver_username: String, message: Message },
+    CreateGroup { group_name: String, member_usernames: Vec<String> }, // Создание группы
+    SendToGroup { group_id: Uuid, message: Message },
 }
 
 #[derive(Serialize, Deserialize)]
 enum ServerResponse {
     Prompt(String),
-    Success(String),
+    Success { message: String, user_id: Uuid },
     Error(String),
     Message(Message),
 }
@@ -62,15 +65,15 @@ pub async fn run_client(addr: &str) -> Result<()> {
                     break;
                 }
                 Ok(n) => {
-                    println!("Raw server response ({} bytes): '{}'", n, line);
+                    println!("Raw server response ({} bytes): '{}'", n, line); // Debug: log raw response
                     if let Ok(server_response) = serde_json::from_str::<ServerResponse>(&line) {
                         match server_response {
                             ServerResponse::Prompt(msg) => println!("Prompt: {}", msg),
-                            ServerResponse::Success(msg) => {
-                                println!("Success: {}", msg);
+                            ServerResponse::Success { message, user_id } => {
+                                println!("Success: {} (user_id: {})", message, user_id);
                                 let mut state = state_clone.lock().await;
                                 state.authenticated = true;
-                                state.user_id = Some(Uuid::new_v4());
+                                state.user_id = Some(user_id);
                             }
                             ServerResponse::Error(msg) => {
                                 println!("Error: {}. Please try again.", msg);
@@ -80,9 +83,15 @@ pub async fn run_client(addr: &str) -> Result<()> {
                                     .decode(&msg.content)
                                     .map_err(|e| anyhow::anyhow!("Base64 decode error: {}", e))?;
                                 let decrypted = crypto_clone.decrypt(&key, &decoded)?;
+                                let sender_info = if msg.group_id.is_some() {
+                                    format!("from group {}", msg.group_id.unwrap())
+                                } else {
+                                    format!("from sender_id: {}", msg.sender_id)
+                                };
                                 println!(
-                                    "Received message: {}",
-                                    String::from_utf8_lossy(&decrypted)
+                                    "Received message: {} ({})",
+                                    String::from_utf8_lossy(&decrypted),
+                                    sender_info
                                 );
                             }
                         }
@@ -141,20 +150,63 @@ pub async fn run_client(addr: &str) -> Result<()> {
                 let public_key = parts[2..].join(" ");
                 ClientMessage::Login { username, public_key }
             }
-            _ => {
+            "send" if parts.len() >= 3 => {
                 if !authenticated {
                     println!("Please login or register first");
                     continue;
                 }
-                let plaintext = input.as_bytes();
+                let receiver_username = parts[1].to_string();
+                let message_content = parts[2..].join(" ");
+                let plaintext = message_content.as_bytes();
                 let encrypted = crypto.encrypt(&key, plaintext)?;
-                ClientMessage::Text(Message {
-                    id: Uuid::new_v4(),
-                    sender_id: user_id.unwrap(),
-                    group_id: None,
-                    content: STANDARD.encode(encrypted),
-                    timestamp: chrono::Utc::now().timestamp(),
-                })
+                ClientMessage::Send {
+                    receiver_username,
+                    message: Message {
+                        id: Uuid::new_v4(),
+                        sender_id: user_id.unwrap(),
+                        receiver_id: None, // Server will fill
+                        group_id: None,
+                        content: STANDARD.encode(encrypted),
+                        timestamp: chrono::Utc::now().timestamp(),
+                    },
+                }
+            }
+            "create_group" if parts.len() >= 3 => {
+                if !authenticated {
+                    println!("Please login or register first");
+                    continue;
+                }
+                let group_name = parts[1].to_string();
+                let member_usernames = parts[2..].iter().map(|s| s.to_string()).collect();
+                ClientMessage::CreateGroup { group_name, member_usernames }
+            }
+            "send_group" if parts.len() >= 3 => {
+                if !authenticated {
+                    println!("Please login or register first");
+                    continue;
+                }
+                let group_id = Uuid::parse_str(parts[1]).map_err(|e| {
+                    println!("Invalid group ID: {}", e);
+                    anyhow::anyhow!("Invalid group ID")
+                })?;
+                let message_content = parts[2..].join(" ");
+                let plaintext = message_content.as_bytes();
+                let encrypted = crypto.encrypt(&key, plaintext)?;
+                ClientMessage::SendToGroup {
+                    group_id,
+                    message: Message {
+                        id: Uuid::new_v4(),
+                        sender_id: user_id.unwrap(),
+                        receiver_id: None,
+                        group_id: Some(group_id),
+                        content: STANDARD.encode(encrypted),
+                        timestamp: chrono::Utc::now().timestamp(),
+                    },
+                }
+            }
+            _ => {
+                println!("Unknown command. Use 'register <username> <public_key>', 'login <username> <public_key>', or 'send <username> <message>'");
+                continue;
             }
         };
 
