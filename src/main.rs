@@ -6,8 +6,6 @@ mod models;
 mod crypto;
 mod storage;
 mod server;
-mod client;
-
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

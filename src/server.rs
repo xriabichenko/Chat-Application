@@ -1,3 +1,4 @@
+// src/server.rs
 use tokio::net::TcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::sync::Arc;
@@ -101,7 +102,7 @@ async fn handle_client(
             Ok(n) => {
                 let data = String::from_utf8_lossy(&buf[..n]);
                 if let Ok(client_msg) = serde_json::from_str::<ClientMessage>(&data) {
-                    let mut storage = storage.lock().await;
+                    let storage = storage.lock().await; // Убрано mut
                     match client_msg {
                         ClientMessage::Register { username, public_key } => {
                             let user = User {
