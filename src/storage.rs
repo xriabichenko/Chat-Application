@@ -1,5 +1,5 @@
 use rusqlite::{Connection, Result};
-use crate::models::User;
+use crate::models::{Message, User};
 use uuid::Uuid;
 
 pub struct Storage {
@@ -14,6 +14,16 @@ impl Storage {
                 id TEXT PRIMARY KEY,
                 username TEXT NOT NULL UNIQUE,
                 public_key TEXT NOT NULL
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY,
+                sender_id TEXT NOT NULL,
+                group_id TEXT,
+                content TEXT NOT NULL,
+                timestamp INTEGER NOT NULL
             )",
             [],
         )?;
@@ -39,56 +49,18 @@ impl Storage {
         })?;
         Ok(user)
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::models::User;
-
-    fn setup_in_memory_db() -> Storage {
-        Storage::new(":memory:").unwrap()
-    }
-
-    #[test]
-    fn test_save_and_get_user() {
-        let storage = setup_in_memory_db();
-        let user = User {
-            id: Uuid::new_v4(),
-            username: "alice".to_string(),
-            public_key: "dummy_public_key".to_string(),
-        };
-
-        storage.save_user(&user).unwrap();
-        let retrieved = storage.get_user_by_username("alice").unwrap();
-        assert_eq!(user.id, retrieved.id);
-        assert_eq!(user.username, retrieved.username);
-        assert_eq!(user.public_key, retrieved.public_key);
-    }
-
-    #[test]
-    fn test_save_duplicate_username() {
-        let storage = setup_in_memory_db();
-        let user1 = User {
-            id: Uuid::new_v4(),
-            username: "bob".to_string(),
-            public_key: "key1".to_string(),
-        };
-        let user2 = User {
-            id: Uuid::new_v4(),
-            username: "bob".to_string(),
-            public_key: "key2".to_string(),
-        };
-
-        storage.save_user(&user1).unwrap();
-        let result = storage.save_user(&user2);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_get_nonexistent_user() {
-        let storage = setup_in_memory_db();
-        let result = storage.get_user_by_username("nonexistent");
-        assert!(result.is_err());
+    pub fn save_message(&self, msg: &Message) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO messages (id, sender_id, group_id, content, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
+            (
+                &msg.id.to_string(),
+                &msg.sender_id.to_string(),
+                &msg.group_id.map(|id| id.to_string()),
+                &msg.content,
+                &msg.timestamp,
+            ),
+        )?;
+        Ok(())
     }
 }

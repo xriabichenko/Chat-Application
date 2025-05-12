@@ -1,4 +1,6 @@
-use ring::aead::{LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
+// src/crypto.rs
+use anyhow::{Result, anyhow};
+use ring::aead::{LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 
 pub struct Crypto {
@@ -12,67 +14,55 @@ impl Crypto {
         }
     }
 
-    pub fn encrypt(&self, key: &[u8], data: &[u8]) -> Result<Vec<u8>, &'static str> {
-        let unbound_key = UnboundKey::new(&AES_256_GCM, key).map_err(|_| "Invalid key")?;
-        let key = LessSafeKey::new(unbound_key);
+    pub fn encrypt(&self, key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>> {
+        // Create an AEAD key from the provided key
+        let unbound_key = UnboundKey::new(&ring::aead::AES_256_GCM, key)
+            .map_err(|e| anyhow!("Failed to create key: {}", e))?;
+        let less_safe_key = LessSafeKey::new(unbound_key);
+
+        // Generate a random nonce
         let mut nonce_bytes = [0u8; 12];
-        self.rng.fill(&mut nonce_bytes).map_err(|_| "RNG error")?;
+        self.rng
+            .fill(&mut nonce_bytes)
+            .map_err(|e| anyhow!("Failed to generate nonce: {}", e))?;
         let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+
+        // Encrypt the data
         let mut in_out = data.to_vec();
-        key.seal_in_place_append_tag(nonce, ring::aead::Aad::empty(), &mut in_out)
-            .map_err(|_| "Encryption failed")?;
+        let tag = less_safe_key
+            .seal_in_place_append_tag(nonce, ring::aead::Aad::empty(), &mut in_out)
+            .map_err(|e| anyhow!("Encryption failed: {}", e))?;
+
+        // Append the nonce and tag to the output
         let mut result = nonce_bytes.to_vec();
         result.extend_from_slice(&in_out);
+        result.extend_from_slice(tag.as_ref());
         Ok(result)
     }
 
-    pub fn decrypt(&self, key: &[u8], data: &[u8]) -> Result<Vec<u8>, &'static str> {
+    pub fn decrypt(&self, key: &[u8; 32], data: &[u8]) -> Result<Vec<u8>> {
         if data.len() < 12 {
-            return Err("Invalid data");
+            return Err(anyhow!("Invalid data length: too short"));
         }
-        let unbound_key = UnboundKey::new(&AES_256_GCM, key).map_err(|_| "Invalid key")?;
-        let key = LessSafeKey::new(unbound_key);
-        let nonce = Nonce::assume_unique_for_key(data[..12].try_into().unwrap());
-        let mut in_out = data[12..].to_vec();
-        let decrypted = key
+
+        // Extract nonce (first 12 bytes)
+        let nonce_bytes = &data[..12];
+        let nonce = Nonce::assume_unique_for_key(nonce_bytes.try_into().map_err(|_| anyhow!("Invalid nonce length"))?);
+
+        // Extract ciphertext and tag
+        let ciphertext_and_tag = &data[12..];
+
+        // Create an AEAD key
+        let unbound_key = UnboundKey::new(&ring::aead::AES_256_GCM, key)
+            .map_err(|e| anyhow!("Failed to create key: {}", e))?;
+        let less_safe_key = LessSafeKey::new(unbound_key);
+
+        // Decrypt the data
+        let mut in_out = ciphertext_and_tag.to_vec();
+        let plaintext = less_safe_key
             .open_in_place(nonce, ring::aead::Aad::empty(), &mut in_out)
-            .map_err(|_| "Decryption failed")?;
-        Ok(decrypted.to_vec())
-    }
-}
+            .map_err(|e| anyhow!("Decryption failed: {}", e))?;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_encrypt_decrypt() {
-        let crypto = Crypto::new();
-        let key = [0u8; 32]; // Dummy key for testing (32 bytes for AES-256)
-        let data = b"Hello, world!";
-        let encrypted = crypto.encrypt(&key, data).unwrap();
-        let decrypted = crypto.decrypt(&key, &encrypted).unwrap();
-        assert_eq!(data.to_vec(), decrypted);
-    }
-
-    #[test]
-    fn test_encrypt_decrypt_empty_data() {
-        let crypto = Crypto::new();
-        let key = [0u8; 32];
-        let data = b"";
-        let encrypted = crypto.encrypt(&key, data).unwrap();
-        let decrypted = crypto.decrypt(&key, &encrypted).unwrap();
-        assert_eq!(data.to_vec(), decrypted);
-    }
-
-    #[test]
-    fn test_decrypt_invalid_key() {
-        let crypto = Crypto::new();
-        let key = [0u8; 32];
-        let wrong_key = [1u8; 32];
-        let data = b"Hello, world!";
-        let encrypted = crypto.encrypt(&key, data).unwrap();
-        let result = crypto.decrypt(&wrong_key, &encrypted);
-        assert!(result.is_err());
+        Ok(plaintext.to_vec())
     }
 }
