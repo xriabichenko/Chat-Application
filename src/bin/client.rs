@@ -29,7 +29,8 @@ enum ClientMessage {
 #[derive(Serialize, Deserialize)]
 enum ServerResponse {
     Prompt(String),
-    Success { message: String, user_id: Uuid },
+    SuccessLogin { message: String, user_id: Uuid },
+    SuccessMSG(String),
     Error(String),
     Message(Message),
     File(File),
@@ -41,6 +42,9 @@ struct ClientState {
     user_id: Option<Uuid>,
 }
 
+fn normalize_path(path: &str) -> String {
+    path.replace("\\\\", "/").replace("\\", "/")
+}
 pub async fn run_client(addr:  &str) -> Result<()> {
     let stream = TcpStream::connect(addr).await?;
     println!("Connected to {}", addr);
@@ -74,12 +78,16 @@ pub async fn run_client(addr:  &str) -> Result<()> {
                     if let Ok(server_response) = serde_json::from_str::<ServerResponse>(&line) {
                         match server_response {
                             ServerResponse::Prompt(msg) => println!("Prompt: {}", msg),
-                            ServerResponse::Success { message, user_id } => {
+                            ServerResponse::SuccessLogin { message, user_id } => {
                                 println!("Success: {} (user_id: {})", message, user_id);
                                 let mut state = state_clone.lock().await;
                                 state.authenticated = true;
                                 state.user_id = Some(user_id);
                             }
+                            ServerResponse::SuccessMSG ( message) => {
+                                println!("Success: {}", message)
+                            }
+
                             ServerResponse::Error(msg) => {
                                 println!("Error: {}. Please try again.", msg);
                             }
@@ -239,18 +247,16 @@ pub async fn run_client(addr:  &str) -> Result<()> {
                     continue;
                 }
                 let receiver_username = parts[1].to_string();
-                let file_path = parts[2].to_string();
+                let file_path = normalize_path(parts[2]); // Нормализуем путь
                 println!("Attempting to read file: {}", file_path);
-                // println!("username: {},  file_path{}", receiver_username, file_path);
                 let file_data = fs::read(&file_path).map_err(|e| {
                     println!("Failed to read file: {}", e);
                     anyhow::anyhow!("Failed to read file")
                 })?;
                 let encrypted = crypto.encrypt(&key, &file_data)?;
-                let filename = file_path
-                    .split('/')
-                    .last()
-                    .or_else(|| file_path.split('\\').last())
+                let filename = std::path::Path::new(&file_path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
                     .unwrap_or("unknown")
                     .to_string();
                 ClientMessage::SendFile {
@@ -265,7 +271,7 @@ pub async fn run_client(addr:  &str) -> Result<()> {
                         timestamp: chrono::Utc::now().timestamp(),
                     },
                 }
-            }
+            },
             "send_file_group" if parts.len() == 3 => {
                 if !authenticated {
                     println!("Please login or register first");

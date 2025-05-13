@@ -25,8 +25,8 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // Keep the main task running
-    println!("Server running on {}", server_addr);
+
+    // println!("Server running on {}", server_addr);
     tokio::signal::ctrl_c().await?;
     println!("Shutting down server...");
 

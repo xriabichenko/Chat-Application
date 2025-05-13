@@ -24,7 +24,8 @@ enum ClientMessage {
 #[derive(Serialize, Deserialize)]
 enum ServerResponse {
     Prompt(String),
-    Success { message: String, user_id: Uuid },
+    SuccessLogin { message: String, user_id: Uuid },
+    SuccessMSG(String),
     Error(String),
     Message(Message),
     File(File),
@@ -120,7 +121,7 @@ async fn handle_client(
                                     authenticated = true;
                                     let mut clients = clients.lock().await;
                                     clients.insert(user.id, tx.clone());
-                                    tx.send(ServerResponse::Success {
+                                    tx.send(ServerResponse::SuccessLogin {
                                         message: format!("Registered and logged in as {}", username),
                                         user_id: user.id,
                                     })
@@ -143,7 +144,7 @@ async fn handle_client(
                                     authenticated = true;
                                     let mut clients = clients.lock().await;
                                     clients.insert(user.id, tx.clone());
-                                    let response = ServerResponse::Success {
+                                    let response = ServerResponse::SuccessLogin {
                                         message: format!("Logged in as {}", username),
                                         user_id: user.id,
                                     };
@@ -205,10 +206,9 @@ async fn handle_client(
                                         receiver_tx
                                             .send(ServerResponse::Message(message.clone()))
                                             .await?;
-                                        tx.send(ServerResponse::Success {
-                                            message: format!("Message sent to {}", receiver_username),
-                                            user_id: receiver.id,
-                                        })
+                                        tx.send(ServerResponse::SuccessMSG (
+                                             format!("Success"),
+                                        ))
                                             .await?;
                                     } else {
                                         tx.send(ServerResponse::Error(
@@ -247,10 +247,9 @@ async fn handle_client(
                                 members,
                             };
                             storage.save_group(&group)?;
-                            tx.send(ServerResponse::Success {
-                                message: format!("Group {} created with {} members (group_id: {})", group.name, group.members.len(), group.id),
-                                user_id: user_id.unwrap(),
-                            }).await?;
+                            tx.send(ServerResponse::SuccessMSG (
+                                format!("Success"),
+                            )).await?;
                         }
                         ClientMessage::SendToGroup { group_id, mut message } => {
                             if !authenticated {
@@ -276,10 +275,9 @@ async fn handle_client(
                                             member_tx.send(ServerResponse::Message(message.clone())).await?;
                                         }
                                     }
-                                    tx.send(ServerResponse::Success {
-                                        message: format!("Message sent to group {}", group_id),
-                                        user_id: user_id.unwrap(),
-                                    }).await?;
+                                    tx.send(ServerResponse::SuccessMSG (
+                                        format!("Success"),
+                                    )).await?;
                                 }
                                 Err(_) => {
                                     tx.send(ServerResponse::Error("Group not found".to_string())).await?;
@@ -305,10 +303,9 @@ async fn handle_client(
                                         receiver_tx
                                             .send(ServerResponse::File(file.clone()))
                                             .await?;
-                                        tx.send(ServerResponse::Success {
-                                            message: format!("File {} sent to {}", file.filename, receiver_username),
-                                            user_id: receiver.id,
-                                        })
+                                        tx.send(ServerResponse::SuccessMSG (
+                                             format!("Success"),
+                                            ))
                                             .await?;
                                     } else {
                                         tx.send(ServerResponse::Error(
@@ -349,10 +346,9 @@ async fn handle_client(
                                             member_tx.send(ServerResponse::File(file.clone())).await?;
                                         }
                                     }
-                                    tx.send(ServerResponse::Success {
-                                        message: format!("File {} sent to group {}", file.filename, group_id),
-                                        user_id: user_id.unwrap(),
-                                    }).await?;
+                                    tx.send(ServerResponse::SuccessMSG (
+                                         format!("Success")
+                                    )).await?;
                                 }
                                 Err(_) => {
                                     tx.send(ServerResponse::Error("Group not found".to_string())).await?;
