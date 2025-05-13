@@ -1,5 +1,5 @@
 use rusqlite::{Connection, Result};
-use crate::models::{Group, Message, User};
+use crate::models::{Group, Message, User, File};
 use uuid::Uuid;
 
 pub struct Storage {
@@ -31,8 +31,6 @@ impl Storage {
             )",
             [],
         )?;
-
-        // Таблица для групп
         conn.execute(
             "CREATE TABLE IF NOT EXISTS groups (
                 id TEXT PRIMARY KEY,
@@ -40,8 +38,6 @@ impl Storage {
             )",
             [],
         )?;
-
-        // Таблица для связи пользователей и групп (участники групп)
         conn.execute(
             "CREATE TABLE IF NOT EXISTS group_members (
                 group_id TEXT NOT NULL,
@@ -52,11 +48,24 @@ impl Storage {
             )",
             [],
         )?;
-
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS files (
+                id TEXT PRIMARY KEY,
+                sender_id TEXT NOT NULL,
+                receiver_id TEXT,
+                group_id TEXT,
+                filename TEXT NOT NULL,
+                data TEXT NOT NULL,
+                timestamp INTEGER NOT NULL,
+                FOREIGN KEY (sender_id) REFERENCES users(id),
+                FOREIGN KEY (receiver_id) REFERENCES users(id),
+                FOREIGN KEY (group_id) REFERENCES groups(id)
+            )",
+            [],
+        )?;
         Ok(Storage { conn })
     }
 
-    /// Сохранение пользователя
     pub fn save_user(&self, user: &User) -> Result<()> {
         self.conn.execute(
             "INSERT INTO users (id, username, public_key) VALUES (?1, ?2, ?3)",
@@ -65,7 +74,6 @@ impl Storage {
         Ok(())
     }
 
-    /// Получение пользователя по имени
     pub fn get_user_by_username(&self, username: &str) -> Result<User> {
         let mut stmt = self.conn.prepare(
             "SELECT id, username, public_key FROM users WHERE username = ?1",
@@ -80,7 +88,6 @@ impl Storage {
         Ok(user)
     }
 
-    /// Сохранение сообщения
     pub fn save_message(&self, msg: &Message) -> Result<()> {
         self.conn.execute(
             "INSERT INTO messages (id, sender_id, receiver_id, group_id, content, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -96,34 +103,25 @@ impl Storage {
         Ok(())
     }
 
-    /// Сохранение группы и её участников
     pub fn save_group(&self, group: &Group) -> Result<()> {
-        // Сохраняем группу
         self.conn.execute(
             "INSERT INTO groups (id, name) VALUES (?1, ?2)",
             (&group.id.to_string(), &group.name),
         )?;
-
-        // Сохраняем участников группы
         for user_id in &group.members {
             self.conn.execute(
                 "INSERT INTO group_members (group_id, user_id) VALUES (?1, ?2)",
                 (&group.id.to_string(), &user_id.to_string()),
             )?;
         }
-
         Ok(())
     }
 
-    /// Получение группы по её ID
     pub fn get_group_by_id(&self, group_id: &Uuid) -> Result<Group> {
-        // Получаем информацию о группе
         let mut stmt = self.conn.prepare("SELECT id, name FROM groups WHERE id = ?1")?;
         let group_info = stmt.query_row([&group_id.to_string()], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
-
-        // Получаем участников группы
         let mut stmt = self.conn.prepare(
             "SELECT user_id FROM group_members WHERE group_id = ?1",
         )?;
@@ -131,7 +129,6 @@ impl Storage {
             Ok(Uuid::parse_str(&row.get::<_, String>(0)?).unwrap())
         })?;
         let members: Vec<Uuid> = member_rows.collect::<Result<Vec<_>>>()?;
-
         Ok(Group {
             id: Uuid::parse_str(&group_info.0).unwrap(),
             name: group_info.1,
@@ -139,11 +136,26 @@ impl Storage {
         })
     }
 
-    /// Добавление пользователя в группу
     pub fn add_user_to_group(&self, group_id: &Uuid, user_id: &Uuid) -> Result<()> {
         self.conn.execute(
             "INSERT INTO group_members (group_id, user_id) VALUES (?1, ?2)",
             (&group_id.to_string(), &user_id.to_string()),
+        )?;
+        Ok(())
+    }
+
+    pub fn save_file(&self, file: &File) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO files (id, sender_id, receiver_id, group_id, filename, data, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (
+                &file.id.to_string(),
+                &file.sender_id.to_string(),
+                &file.receiver_id.map(|id| id.to_string()),
+                &file.group_id.map(|id| id.to_string()),
+                &file.filename,
+                &file.data,
+                &file.timestamp,
+            ),
         )?;
         Ok(())
     }

@@ -3,7 +3,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use std::sync::Arc;
 use tokio::sync::{Mutex, mpsc};
 use crate::storage::Storage;
-use crate::models::{Message, User, Group};
+use crate::models::{Message, User, Group, File};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use std::collections::HashMap;
@@ -15,16 +15,20 @@ enum ClientMessage {
     Login { username: String, public_key: String },
     Text(Message),
     Send { receiver_username: String, message: Message },
-    CreateGroup { group_name: String, member_usernames: Vec<String> }, // Создание группы
+    CreateGroup { group_name: String, member_usernames: Vec<String> },
     SendToGroup { group_id: Uuid, message: Message },
+    SendFile { receiver_username: String, file: File },
+    SendFileToGroup { group_id: Uuid, file: File },
 }
 
 #[derive(Serialize, Deserialize)]
 enum ServerResponse {
     Prompt(String),
-    Success { message: String, user_id: Uuid },
+    SuccessLogin { message: String, user_id: Uuid },
+    SuccessMSG(String),
     Error(String),
     Message(Message),
+    File(File),
 }
 
 pub struct Server {
@@ -73,7 +77,7 @@ async fn handle_client(
     tokio::spawn(async move {
         while let Some(response) = rx.recv().await {
             let response_json = serde_json::to_string(&response)?;
-            println!("Sending to client: {}", response_json); // Debug: log sent response
+            // println!("Sending to client: {}", response_json);
             socket_write.write_all(response_json.as_bytes()).await?;
             socket_write.write_all(b"\n").await?;
             socket_write.flush().await?;
@@ -82,7 +86,7 @@ async fn handle_client(
     });
 
     tx.send(ServerResponse::Prompt(
-        "Please send 'login <username> <public_key>', 'register <username> <public_key>', 'send <username> <message>', 'create_group <group_name> <username1> <username2> ...', or 'send_group <group_id> <message>'".to_string(),
+        "Please send 'login <username> <public_key>', 'register <username> <public_key>', 'send <username> <message>', 'create_group <group_name> <username1> <username2> ...', 'send_group <group_id> <message>', 'send_file <username> <filename>', or 'send_file_group <group_id> <filename>'".to_string(),
     ))
         .await?;
 
@@ -117,7 +121,7 @@ async fn handle_client(
                                     authenticated = true;
                                     let mut clients = clients.lock().await;
                                     clients.insert(user.id, tx.clone());
-                                    tx.send(ServerResponse::Success {
+                                    tx.send(ServerResponse::SuccessLogin {
                                         message: format!("Registered and logged in as {}", username),
                                         user_id: user.id,
                                     })
@@ -140,7 +144,7 @@ async fn handle_client(
                                     authenticated = true;
                                     let mut clients = clients.lock().await;
                                     clients.insert(user.id, tx.clone());
-                                    let response = ServerResponse::Success {
+                                    let response = ServerResponse::SuccessLogin {
                                         message: format!("Logged in as {}", username),
                                         user_id: user.id,
                                     };
@@ -202,10 +206,9 @@ async fn handle_client(
                                         receiver_tx
                                             .send(ServerResponse::Message(message.clone()))
                                             .await?;
-                                        tx.send(ServerResponse::Success {
-                                            message: format!("Message sent to {}", receiver_username),
-                                            user_id: receiver.id,
-                                        })
+                                        tx.send(ServerResponse::SuccessMSG (
+                                             format!("Success"),
+                                        ))
                                             .await?;
                                     } else {
                                         tx.send(ServerResponse::Error(
@@ -229,8 +232,6 @@ async fn handle_client(
                             }
                             let mut storage = storage.lock().await;
                             let mut members = vec![user_id.unwrap()];
-
-                            // Найти ID пользователей по именам
                             for username in member_usernames {
                                 match storage.get_user_by_username(&username) {
                                     Ok(user) => members.push(user.id),
@@ -240,18 +241,15 @@ async fn handle_client(
                                     }
                                 }
                             }
-                            // Создать группу
                             let group = Group {
                                 id: Uuid::new_v4(),
                                 name: group_name,
                                 members,
                             };
                             storage.save_group(&group)?;
-
-                            tx.send(ServerResponse::Success {
-                                message: format!("Group {} created with {} members (group_id: {})", group.name, group.members.len(), group.id),
-                                user_id: user_id.unwrap(),
-                            }).await?;
+                            tx.send(ServerResponse::SuccessMSG (
+                                format!("Success"),
+                            )).await?;
                         }
                         ClientMessage::SendToGroup { group_id, mut message } => {
                             if !authenticated {
@@ -262,7 +260,6 @@ async fn handle_client(
                                 tx.send(ServerResponse::Error("Invalid sender_id".to_string())).await?;
                                 continue;
                             }
-
                             let storage = storage.lock().await;
                             match storage.get_group_by_id(&group_id) {
                                 Ok(group) => {
@@ -272,17 +269,86 @@ async fn handle_client(
                                     }
                                     message.group_id = Some(group_id);
                                     storage.save_message(&message)?;
-
                                     let clients = clients.lock().await;
                                     for member_id in group.members {
                                         if let Some(member_tx) = clients.get(&member_id) {
                                             member_tx.send(ServerResponse::Message(message.clone())).await?;
                                         }
                                     }
-                                    tx.send(ServerResponse::Success {
-                                        message: format!("Message sent to group {}", group_id),
-                                        user_id: user_id.unwrap(),
-                                    }).await?;
+                                    tx.send(ServerResponse::SuccessMSG (
+                                        format!("Success"),
+                                    )).await?;
+                                }
+                                Err(_) => {
+                                    tx.send(ServerResponse::Error("Group not found".to_string())).await?;
+                                }
+                            }
+                        }
+                        ClientMessage::SendFile { receiver_username, mut file } => {
+                            if !authenticated {
+                                tx.send(ServerResponse::Error("Not authenticated".to_string())).await?;
+                                continue;
+                            }
+                            if user_id != Some(file.sender_id) {
+                                tx.send(ServerResponse::Error("Invalid sender_id".to_string())).await?;
+                                continue;
+                            }
+                            let storage = storage.lock().await;
+                            match storage.get_user_by_username(&receiver_username) {
+                                Ok(receiver) => {
+                                    file.receiver_id = Some(receiver.id);
+                                    storage.save_file(&file)?;
+                                    let clients = clients.lock().await;
+                                    if let Some(receiver_tx) = clients.get(&receiver.id) {
+                                        receiver_tx
+                                            .send(ServerResponse::File(file.clone()))
+                                            .await?;
+                                        tx.send(ServerResponse::SuccessMSG (
+                                             format!("Success"),
+                                            ))
+                                            .await?;
+                                    } else {
+                                        tx.send(ServerResponse::Error(
+                                            "Recipient is offline".to_string(),
+                                        ))
+                                            .await?;
+                                    }
+                                }
+                                Err(_) => {
+                                    tx.send(ServerResponse::Error(
+                                        "Recipient not found".to_string(),
+                                    ))
+                                        .await?;
+                                }
+                            }
+                        }
+                        ClientMessage::SendFileToGroup { group_id, mut file } => {
+                            if !authenticated {
+                                tx.send(ServerResponse::Error("Not authenticated".to_string())).await?;
+                                continue;
+                            }
+                            if user_id != Some(file.sender_id) {
+                                tx.send(ServerResponse::Error("Invalid sender_id".to_string())).await?;
+                                continue;
+                            }
+                            let storage = storage.lock().await;
+                            match storage.get_group_by_id(&group_id) {
+                                Ok(group) => {
+                                    if !group.members.contains(&file.sender_id) {
+                                        tx.send(ServerResponse::Error("You are not a member of this group".to_string())).await?;
+                                        continue;
+                                    }
+                                    file.group_id = Some(group_id);
+                                    storage.save_file(&file)?;
+                                    let clients = clients.lock().await;
+                                    for member_id in group.members {
+                                        if let Some(member_tx) = clients.get(&member_id) {
+                                            member_tx.send(ServerResponse::File(file.clone())).await?;
+                                        }
+                                    }
+                                    tx.send(ServerResponse::SuccessMSG (
+                                         format!("Success")
+                                    )).await?;
                                 }
                                 Err(_) => {
                                     tx.send(ServerResponse::Error("Group not found".to_string())).await?;

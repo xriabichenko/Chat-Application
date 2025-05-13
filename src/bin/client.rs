@@ -1,4 +1,4 @@
-use chat_application::models::Message;
+use chat_application::models::{Message, File};
 use chat_application::crypto::Crypto;
 use tokio::net::TcpStream;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -11,6 +11,8 @@ use std::env;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
+use std::fs;
+use chrono::{DateTime, Utc};
 
 #[derive(Serialize, Deserialize)]
 enum ClientMessage {
@@ -18,16 +20,20 @@ enum ClientMessage {
     Login { username: String, public_key: String },
     Text(Message),
     Send { receiver_username: String, message: Message },
-    CreateGroup { group_name: String, member_usernames: Vec<String> }, // Создание группы
+    CreateGroup { group_name: String, member_usernames: Vec<String> },
     SendToGroup { group_id: Uuid, message: Message },
+    SendFile { receiver_username: String, file: File },
+    SendFileToGroup { group_id: Uuid, file: File },
 }
 
 #[derive(Serialize, Deserialize)]
 enum ServerResponse {
     Prompt(String),
-    Success { message: String, user_id: Uuid },
+    SuccessLogin { message: String, user_id: Uuid },
+    SuccessMSG(String),
     Error(String),
     Message(Message),
+    File(File),
 }
 
 // Shared state for authentication
@@ -36,7 +42,10 @@ struct ClientState {
     user_id: Option<Uuid>,
 }
 
-pub async fn run_client(addr: &str) -> Result<()> {
+fn normalize_path(path: &str) -> String {
+    path.replace("\\\\", "/").replace("\\", "/")
+}
+pub async fn run_client(addr:  &str) -> Result<()> {
     let stream = TcpStream::connect(addr).await?;
     println!("Connected to {}", addr);
 
@@ -65,16 +74,20 @@ pub async fn run_client(addr: &str) -> Result<()> {
                     break;
                 }
                 Ok(n) => {
-                    println!("Raw server response ({} bytes): '{}'", n, line); // Debug: log raw response
+                    println!("Raw server response ({} bytes): '{}'", n, line);
                     if let Ok(server_response) = serde_json::from_str::<ServerResponse>(&line) {
                         match server_response {
                             ServerResponse::Prompt(msg) => println!("Prompt: {}", msg),
-                            ServerResponse::Success { message, user_id } => {
+                            ServerResponse::SuccessLogin { message, user_id } => {
                                 println!("Success: {} (user_id: {})", message, user_id);
                                 let mut state = state_clone.lock().await;
                                 state.authenticated = true;
                                 state.user_id = Some(user_id);
                             }
+                            ServerResponse::SuccessMSG ( message) => {
+                                println!("Success: {}", message)
+                            }
+
                             ServerResponse::Error(msg) => {
                                 println!("Error: {}. Please try again.", msg);
                             }
@@ -88,10 +101,34 @@ pub async fn run_client(addr: &str) -> Result<()> {
                                 } else {
                                     format!("from sender_id: {}", msg.sender_id)
                                 };
+                                let timestamp: DateTime<Utc> = DateTime::from_timestamp(msg.timestamp, 0).unwrap_or_default();
                                 println!(
-                                    "Received message: {} ({})",
+                                    "Received message: {} ({} at {})",
                                     String::from_utf8_lossy(&decrypted),
-                                    sender_info
+                                    sender_info,
+                                    timestamp.to_rfc3339()
+                                );
+                            }
+                            ServerResponse::File(file) => {
+                                let decoded = STANDARD
+                                    .decode(&file.data)
+                                    .map_err(|e| anyhow::anyhow!("Base64 decode error: {}", e))?;
+                                let decrypted = crypto_clone.decrypt(&key, &decoded)?;
+                                let output_path = format!("received_{}", file.filename);
+                                fs::write(&output_path, decrypted)?;
+                                let sender_info = if file.group_id.is_some() {
+                                    format!("from group {}", file.group_id.unwrap())
+                                } else {
+                                    format!(
+                                        "from sender_id: {} to receiver_id: {}",
+                                        file.sender_id,
+                                        file.receiver_id.map_or("unknown".to_string(), |id| id.to_string())
+                                    )
+                                };
+                                let timestamp: DateTime<Utc> = DateTime::from_timestamp(file.timestamp, 0).unwrap_or_default();
+                                println!(
+                                    "Received file: {} saved as {} ({} at {})",
+                                    file.filename, output_path, sender_info, timestamp.to_rfc3339()
                                 );
                             }
                         }
@@ -164,7 +201,7 @@ pub async fn run_client(addr: &str) -> Result<()> {
                     message: Message {
                         id: Uuid::new_v4(),
                         sender_id: user_id.unwrap(),
-                        receiver_id: None, // Server will fill
+                        receiver_id: None,
                         group_id: None,
                         content: STANDARD.encode(encrypted),
                         timestamp: chrono::Utc::now().timestamp(),
@@ -204,19 +241,83 @@ pub async fn run_client(addr: &str) -> Result<()> {
                     },
                 }
             }
+            "send_file" if parts.len() == 3 => {
+                if !authenticated {
+                    println!("Please login or register first");
+                    continue;
+                }
+                let receiver_username = parts[1].to_string();
+                let file_path = normalize_path(parts[2]); // Нормализуем путь
+                println!("Attempting to read file: {}", file_path);
+                let file_data = fs::read(&file_path).map_err(|e| {
+                    println!("Failed to read file: {}", e);
+                    anyhow::anyhow!("Failed to read file")
+                })?;
+                let encrypted = crypto.encrypt(&key, &file_data)?;
+                let filename = std::path::Path::new(&file_path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                ClientMessage::SendFile {
+                    receiver_username,
+                    file: File {
+                        id: Uuid::new_v4(),
+                        sender_id: user_id.unwrap(),
+                        receiver_id: None, // Server will set
+                        group_id: None,
+                        filename,
+                        data: STANDARD.encode(encrypted),
+                        timestamp: chrono::Utc::now().timestamp(),
+                    },
+                }
+            },
+            "send_file_group" if parts.len() == 3 => {
+                if !authenticated {
+                    println!("Please login or register first");
+                    continue;
+                }
+                let group_id = Uuid::parse_str(parts[1]).map_err(|e| {
+                    println!("Invalid group ID: {}", e);
+                    anyhow::anyhow!("Invalid group ID")
+                })?;
+                let file_path = parts[2].to_string();
+                let file_data = fs::read(&file_path).map_err(|e| {
+                    println!("Failed to read file: {}", e);
+                    anyhow::anyhow!("Failed to read file")
+                })?;
+                let encrypted = crypto.encrypt(&key, &file_data)?;
+                let filename = file_path
+                    .split('/')
+                    .last()
+                    .or_else(|| file_path.split('\\').last())
+                    .unwrap_or("unknown")
+                    .to_string();
+                ClientMessage::SendFileToGroup {
+                    group_id,
+                    file: File {
+                        id: Uuid::new_v4(),
+                        sender_id: user_id.unwrap(),
+                        receiver_id: None,
+                        group_id: Some(group_id),
+                        filename,
+                        data: STANDARD.encode(encrypted),
+                        timestamp: chrono::Utc::now().timestamp(),
+                    },
+                }
+            }
             _ => {
-                println!("Unknown command. Use 'register <username> <public_key>', 'login <username> <public_key>', or 'send <username> <message>'");
+                println!("Unknown command. Use 'register <username> <public_key>', 'login <username> <public_key>', 'send <username> <message>', 'create_group <group_name> <username1> <username2> ...', 'send_group <group_id> <message>', 'send_file <username> <filepath>', or 'send_file_group <group_id> <filepath>'");
                 continue;
             }
         };
 
         let msg_json = serde_json::to_string(&msg)?;
-        println!("Sending: {}", msg_json);
+        // println!("Sending: {}", msg_json);
         writer.write_all(msg_json.as_bytes()).await?;
         writer.write_all(b"\n").await?;
         writer.flush().await?;
 
-        // Brief delay to allow server response
         if matches!(msg, ClientMessage::Register { .. } | ClientMessage::Login { .. }) {
             sleep(Duration::from_millis(100)).await;
         }
