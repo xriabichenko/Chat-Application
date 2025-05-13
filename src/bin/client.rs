@@ -1,5 +1,7 @@
-use chat_application::models::{Message, File};
-use chat_application::crypto::Crypto;
+use iced::{
+    widget::{button, column, row, text, text_input, container, scrollable},
+    Alignment, Element, Length, Application, Command, Settings, Theme, Subscription,
+};
 use tokio::net::TcpStream;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use serde::{Deserialize, Serialize};
@@ -7,14 +9,14 @@ use uuid::Uuid;
 use anyhow::Result;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use std::env;
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::time::{sleep, Duration};
 use std::fs;
 use chrono::{DateTime, Utc};
+use chat_application::models::{Message, File};
+use chat_application::crypto::Crypto;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 enum ClientMessage {
     Register { username: String, public_key: String },
     Login { username: String, public_key: String },
@@ -26,7 +28,7 @@ enum ClientMessage {
     SendFileToGroup { group_id: Uuid, file: File },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 enum ServerResponse {
     Prompt(String),
     SuccessLogin { message: String, user_id: Uuid },
@@ -36,301 +38,683 @@ enum ServerResponse {
     File(File),
 }
 
-// Shared state for authentication
+#[derive(Default)]
 struct ClientState {
     authenticated: bool,
     user_id: Option<Uuid>,
 }
 
-fn normalize_path(path: &str) -> String {
-    path.replace("\\\\", "/").replace("\\", "/")
+struct ChatApp {
+    server_addr: String,
+    username: String,
+    public_key: String,
+    receiver_username: String,
+    group_name: String,
+    group_members: String,
+    group_id: String,
+    message_input: String,
+    file_path: String,
+    messages: Vec<String>,
+    status: String,
+    client_state: Arc<Mutex<ClientState>>,
+    writer: Arc<Mutex<Option<tokio::io::WriteHalf<TcpStream>>>>,
+    reader: Arc<Mutex<Option<BufReader<tokio::io::ReadHalf<TcpStream>>>>>,
+    crypto: Crypto,
+    key: [u8; 32],
+    view: View,
 }
-pub async fn run_client(addr:  &str) -> Result<()> {
-    let stream = TcpStream::connect(addr).await?;
-    println!("Connected to {}", addr);
 
-    let (reader, mut writer) = tokio::io::split(stream);
-    let crypto = Crypto::new();
-    let crypto_clone = crypto.clone();
-    let key = [0u8; 32]; // Dummy key for testing
+#[derive(Default, Clone, PartialEq)]
+enum View {
+    #[default]
+    Login,
+    Chat,
+}
 
-    // Shared state
-    let state = Arc::new(Mutex::new(ClientState {
-        authenticated: false,
-        user_id: None,
-    }));
-    let state_clone = Arc::clone(&state);
+#[derive(Clone, Debug)]
+enum AppMessage {
+    UsernameChanged(String),
+    PublicKeyChanged(String),
+    ReceiverUsernameChanged(String),
+    GroupNameChanged(String),
+    GroupMembersChanged(String),
+    GroupIdChanged(String),
+    MessageInputChanged(String),
+    FilePathChanged(String),
+    Register,
+    Login,
+    SendMessage,
+    CreateGroup,
+    SendGroupMessage,
+    SendFile,
+    SendFileToGroup,
+    ServerResponse(ServerResponse),
+    Connect,
+    Error(String),
+}
 
-    // Spawn a task to read server responses
-    tokio::spawn(async move {
-        let mut reader = BufReader::new(reader);
-        let mut line = String::new();
+impl Application for ChatApp {
+    type Executor = iced::executor::Default;
+    type Message = AppMessage;
+    type Theme = Theme;
+    type Flags = ();
 
-        loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) => {
-                    println!("Server disconnected");
-                    break;
+    fn new(_flags: ()) -> (Self, Command<AppMessage>) {
+        (
+            ChatApp {
+                server_addr: "127.0.0.1:8080".to_string(),
+                username: String::new(),
+                public_key: String::new(),
+                receiver_username: String::new(),
+                group_name: String::new(),
+                group_members: String::new(),
+                group_id: String::new(),
+                message_input: String::new(),
+                file_path: String::new(),
+                messages: vec![],
+                status: "Disconnected".to_string(),
+                client_state: Arc::new(Mutex::new(ClientState::default())),
+                writer: Arc::new(Mutex::new(None)),
+                reader: Arc::new(Mutex::new(None)),
+                crypto: Crypto::new(),
+                key: [0u8; 32],
+                view: View::Login,
+            },
+            Command::perform(async { AppMessage::Connect }, |msg| msg),
+        )
+    }
+
+    fn title(&self) -> String {
+        String::from("Chat Application")
+    }
+
+    fn update(&mut self, message: AppMessage) -> Command<AppMessage> {
+        match message {
+            AppMessage::UsernameChanged(username) => {
+                self.username = username;
+                Command::none()
+            }
+            AppMessage::PublicKeyChanged(public_key) => {
+                self.public_key = public_key;
+                Command::none()
+            }
+            AppMessage::ReceiverUsernameChanged(receiver) => {
+                self.receiver_username = receiver;
+                Command::none()
+            }
+            AppMessage::GroupNameChanged(group_name) => {
+                self.group_name = group_name;
+                Command::none()
+            }
+            AppMessage::GroupMembersChanged(members) => {
+                self.group_members = members;
+                Command::none()
+            }
+            AppMessage::GroupIdChanged(group_id) => {
+                self.group_id = group_id;
+                Command::none()
+            }
+            AppMessage::MessageInputChanged(message) => {
+                self.message_input = message;
+                Command::none()
+            }
+            AppMessage::FilePathChanged(file_path) => {
+                self.file_path = file_path;
+                Command::none()
+            }
+            AppMessage::Register => {
+                if self.username.is_empty() || self.public_key.is_empty() {
+                    self.status = "Username and public key required".to_string();
+                    return Command::none();
                 }
-                Ok(n) => {
-                    println!("Raw server response ({} bytes): '{}'", n, line);
-                    if let Ok(server_response) = serde_json::from_str::<ServerResponse>(&line) {
-                        match server_response {
-                            ServerResponse::Prompt(msg) => println!("Prompt: {}", msg),
-                            ServerResponse::SuccessLogin { message, user_id } => {
-                                println!("Success: {} (user_id: {})", message, user_id);
-                                let mut state = state_clone.lock().await;
-                                state.authenticated = true;
-                                state.user_id = Some(user_id);
+                let msg = ClientMessage::Register {
+                    username: self.username.clone(),
+                    public_key: self.public_key.clone(),
+                };
+                let writer = Arc::clone(&self.writer);
+                Command::perform(
+                    async move { send_message(writer, msg).await },
+                    |result| match result {
+                        Ok(()) => AppMessage::Error("Expected unit message".to_string()),
+                        Err(e) => AppMessage::Error(e.to_string()),
+                    },
+                )
+            }
+            AppMessage::Login => {
+                if self.username.is_empty() || self.public_key.is_empty() {
+                    self.status = "Username and public key required".to_string();
+                    return Command::none();
+                }
+                let msg = ClientMessage::Login {
+                    username: self.username.clone(),
+                    public_key: self.public_key.clone(),
+                };
+                self.view = View::Chat;
+                let writer = Arc::clone(&self.writer);
+                Command::perform(
+                    async move { send_message(writer, msg).await },
+                    |result| match result {
+                        Ok(()) => AppMessage::Error("Expected unit message".to_string()),
+                        Err(e) => AppMessage::Error(e.to_string()),
+                    },
+                )
+            }
+            AppMessage::SendMessage => {
+                if !self.client_state.blocking_lock().authenticated {
+                    self.status = "Please login first".to_string();
+                    return Command::none();
+                }
+                if self.receiver_username.is_empty() || self.message_input.is_empty() {
+                    self.status = "Receiver username and message required".to_string();
+                    return Command::none();
+                }
+                let plaintext = self.message_input.as_bytes();
+                let encrypted = self.crypto.encrypt(&self.key, plaintext).unwrap();
+                let msg = ClientMessage::Send {
+                    receiver_username: self.receiver_username.clone(),
+                    message: Message {
+                        id: Uuid::new_v4(),
+                        sender_id: self.client_state.blocking_lock().user_id.unwrap(),
+                        receiver_id: None,
+                        group_id: None,
+                        content: STANDARD.encode(encrypted),
+                        timestamp: chrono::Utc::now().timestamp(),
+                    },
+                };
+                self.message_input.clear();
+                let writer = Arc::clone(&self.writer);
+                Command::perform(
+                    async move { send_message(writer, msg).await },
+                    |result| match result {
+                        Ok(()) => AppMessage::Error("Expected unit message".to_string()),
+                        Err(e) => AppMessage::Error(e.to_string()),
+                    },
+                )
+            }
+            AppMessage::CreateGroup => {
+                if !self.client_state.blocking_lock().authenticated {
+                    self.status = "Please login first".to_string();
+                    return Command::none();
+                }
+                if self.group_name.is_empty() || self.group_members.is_empty() {
+                    self.status = "Group name and members required".to_string();
+                    return Command::none();
+                }
+                let members: Vec<String> = self.group_members
+                    .split_whitespace()
+                    .map(String::from)
+                    .collect();
+                let msg = ClientMessage::CreateGroup {
+                    group_name: self.group_name.clone(),
+                    member_usernames: members,
+                };
+                self.group_name.clear();
+                self.group_members.clear();
+                let writer = Arc::clone(&self.writer);
+                Command::perform(
+                    async move { send_message(writer, msg).await },
+                    |result| match result {
+                        Ok(()) => AppMessage::Error("Expected unit message".to_string()),
+                        Err(e) => AppMessage::Error(e.to_string()),
+                    },
+                )
+            }
+            AppMessage::SendGroupMessage => {
+                if !self.client_state.blocking_lock().authenticated {
+                    self.status = "Please login first".to_string();
+                    return Command::none();
+                }
+                if self.group_id.is_empty() || self.message_input.is_empty() {
+                    self.status = "Group ID and message required".to_string();
+                    return Command::none();
+                }
+                let group_id = match Uuid::parse_str(&self.group_id) {
+                    Ok(id) => id,
+                    Err(_) => {
+                        self.status = "Invalid group ID".to_string();
+                        return Command::none();
+                    }
+                };
+                let plaintext = self.message_input.as_bytes();
+                let encrypted = self.crypto.encrypt(&self.key, plaintext).unwrap();
+                let msg = ClientMessage::SendToGroup {
+                    group_id,
+                    message: Message {
+                        id: Uuid::new_v4(),
+                        sender_id: self.client_state.blocking_lock().user_id.unwrap(),
+                        receiver_id: None,
+                        group_id: Some(group_id),
+                        content: STANDARD.encode(encrypted),
+                        timestamp: chrono::Utc::now().timestamp(),
+                    },
+                };
+                self.message_input.clear();
+                let writer = Arc::clone(&self.writer);
+                Command::perform(
+                    async move { send_message(writer, msg).await },
+                    |result| match result {
+                        Ok(()) => AppMessage::Error("Expected unit message".to_string()),
+                        Err(e) => AppMessage::Error(e.to_string()),
+                    },
+                )
+            }
+            AppMessage::SendFile => {
+                if !self.client_state.blocking_lock().authenticated {
+                    self.status = "Please login first".to_string();
+                    return Command::none();
+                }
+                if self.receiver_username.is_empty() || self.file_path.is_empty() {
+                    self.status = "Receiver username and file path required".to_string();
+                    return Command::none();
+                }
+                let file_path = normalize_path(&self.file_path);
+                let file_data = match fs::read(&file_path) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        self.status = format!("Failed to read file: {}", e);
+                        return Command::none();
+                    }
+                };
+                let encrypted = self.crypto.encrypt(&self.key, &file_data).unwrap();
+                let filename = std::path::Path::new(&file_path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let msg = ClientMessage::SendFile {
+                    receiver_username: self.receiver_username.clone(),
+                    file: File {
+                        id: Uuid::new_v4(),
+                        sender_id: self.client_state.blocking_lock().user_id.unwrap(),
+                        receiver_id: None,
+                        group_id: None,
+                        filename,
+                        data: STANDARD.encode(encrypted),
+                        timestamp: chrono::Utc::now().timestamp(),
+                    },
+                };
+                self.file_path.clear();
+                let writer = Arc::clone(&self.writer);
+                Command::perform(
+                    async move { send_message(writer, msg).await },
+                    |result| match result {
+                        Ok(()) => AppMessage::Error("Expected unit message".to_string()),
+                        Err(e) => AppMessage::Error(e.to_string()),
+                    },
+                )
+            }
+            AppMessage::SendFileToGroup => {
+                if !self.client_state.blocking_lock().authenticated {
+                    self.status = "Please login first".to_string();
+                    return Command::none();
+                }
+                if self.group_id.is_empty() || self.file_path.is_empty() {
+                    self.status = "Group ID and file path required".to_string();
+                    return Command::none();
+                }
+                let group_id = match Uuid::parse_str(&self.group_id) {
+                    Ok(id) => id,
+                    Err(_) => {
+                        self.status = "Invalid group ID".to_string();
+                        return Command::none();
+                    }
+                };
+                let file_path = normalize_path(&self.file_path);
+                let file_data = match fs::read(&file_path) {
+                    Ok(data) => data,
+                    Err(e) => {
+                        self.status = format!("Failed to read file: {}", e);
+                        return Command::none();
+                    }
+                };
+                let encrypted = self.crypto.encrypt(&self.key, &file_data).unwrap();
+                let filename = std::path::Path::new(&file_path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let msg = ClientMessage::SendFileToGroup {
+                    group_id,
+                    file: File {
+                        id: Uuid::new_v4(),
+                        sender_id: self.client_state.blocking_lock().user_id.unwrap(),
+                        receiver_id: None,
+                        group_id: Some(group_id),
+                        filename,
+                        data: STANDARD.encode(encrypted),
+                        timestamp: chrono::Utc::now().timestamp(),
+                    },
+                };
+                self.file_path.clear();
+                let writer = Arc::clone(&self.writer);
+                Command::perform(
+                    async move { send_message(writer, msg).await },
+                    |result| match result {
+                        Ok(()) => AppMessage::Error("Expected unit message".to_string()),
+                        Err(e) => AppMessage::Error(e.to_string()),
+                    },
+                )
+            }
+            AppMessage::ServerResponse(response) => {
+                match response {
+                    ServerResponse::Prompt(msg) => {
+                        self.status = msg;
+                    }
+                    ServerResponse::SuccessLogin { message, user_id } => {
+                        self.status = format!("Success: {} (user_id: {})", message, user_id);
+                        let mut state = self.client_state.blocking_lock();
+                        state.authenticated = true;
+                        state.user_id = Some(user_id);
+                        self.view = View::Chat;
+                    }
+                    ServerResponse::SuccessMSG(message) => {
+                        self.status = format!("Success: {}", message);
+                    }
+                    ServerResponse::Error(msg) => {
+                        self.status = format!("Error: {}", msg);
+                    }
+                    ServerResponse::Message(msg) => {
+                        let decoded = match STANDARD.decode(&msg.content) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                self.status = format!("Base64 decode error: {}", e);
+                                return Command::none();
                             }
-                            ServerResponse::SuccessMSG ( message) => {
-                                println!("Success: {}", message)
+                        };
+                        let decrypted = match self.crypto.decrypt(&self.key, &decoded) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                self.status = format!("Decryption error: {}", e);
+                                return Command::none();
                             }
-
-                            ServerResponse::Error(msg) => {
-                                println!("Error: {}. Please try again.", msg);
+                        };
+                        let sender_info = if msg.group_id.is_some() {
+                            format!("from group {}", msg.group_id.unwrap())
+                        } else {
+                            format!("from sender_id: {}", msg.sender_id)
+                        };
+                        let timestamp: DateTime<Utc> = DateTime::from_timestamp(msg.timestamp, 0)
+                            .unwrap_or_default();
+                        let display = format!(
+                            "[{}] {}: {}",
+                            timestamp.to_rfc3339(),
+                            sender_info,
+                            String::from_utf8_lossy(&decrypted)
+                        );
+                        self.messages.push(display);
+                    }
+                    ServerResponse::File(file) => {
+                        let decoded = match STANDARD.decode(&file.data) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                self.status = format!("Base64 decode error: {}", e);
+                                return Command::none();
                             }
-                            ServerResponse::Message(msg) => {
-                                let decoded = STANDARD
-                                    .decode(&msg.content)
-                                    .map_err(|e| anyhow::anyhow!("Base64 decode error: {}", e))?;
-                                let decrypted = crypto_clone.decrypt(&key, &decoded)?;
-                                let sender_info = if msg.group_id.is_some() {
-                                    format!("from group {}", msg.group_id.unwrap())
-                                } else {
-                                    format!("from sender_id: {}", msg.sender_id)
-                                };
-                                let timestamp: DateTime<Utc> = DateTime::from_timestamp(msg.timestamp, 0).unwrap_or_default();
-                                println!(
-                                    "Received message: {} ({} at {})",
-                                    String::from_utf8_lossy(&decrypted),
-                                    sender_info,
-                                    timestamp.to_rfc3339()
-                                );
+                        };
+                        let decrypted = match self.crypto.decrypt(&self.key, &decoded) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                self.status = format!("Decryption error: {}", e);
+                                return Command::none();
                             }
-                            ServerResponse::File(file) => {
-                                let decoded = STANDARD
-                                    .decode(&file.data)
-                                    .map_err(|e| anyhow::anyhow!("Base64 decode error: {}", e))?;
-                                let decrypted = crypto_clone.decrypt(&key, &decoded)?;
-                                let output_path = format!("received_{}", file.filename);
-                                fs::write(&output_path, decrypted)?;
-                                let sender_info = if file.group_id.is_some() {
-                                    format!("from group {}", file.group_id.unwrap())
-                                } else {
-                                    format!(
-                                        "from sender_id: {} to receiver_id: {}",
-                                        file.sender_id,
-                                        file.receiver_id.map_or("unknown".to_string(), |id| id.to_string())
-                                    )
-                                };
-                                let timestamp: DateTime<Utc> = DateTime::from_timestamp(file.timestamp, 0).unwrap_or_default();
-                                println!(
-                                    "Received file: {} saved as {} ({} at {})",
-                                    file.filename, output_path, sender_info, timestamp.to_rfc3339()
-                                );
-                            }
+                        };
+                        let output_path = format!("received_{}", file.filename);
+                        if let Err(e) = fs::write(&output_path, decrypted) {
+                            self.status = format!("Failed to save file: {}", e);
+                            return Command::none();
                         }
-                    } else {
-                        println!("Invalid response: {}", line);
+                        let sender_info = if file.group_id.is_some() {
+                            format!("from group {}", file.group_id.unwrap())
+                        } else {
+                            format!(
+                                "from sender_id: {} to receiver_id: {}",
+                                file.sender_id,
+                                file.receiver_id.map_or("unknown".to_string(), |id| id.to_string())
+                            )
+                        };
+                        let timestamp: DateTime<Utc> = DateTime::from_timestamp(file.timestamp, 0)
+                            .unwrap_or_default();
+                        let display = format!(
+                            "[{}] {}: File {} saved as {}",
+                            timestamp.to_rfc3339(),
+                            sender_info,
+                            file.filename,
+                            output_path
+                        );
+                        self.messages.push(display);
                     }
                 }
-                Err(e) => {
-                    println!("Error reading: {}", e);
-                    break;
-                }
+                Command::none()
             }
-        }
-        Ok::<(), anyhow::Error>(())
-    });
-
-    let stdin = tokio::io::stdin();
-    let mut reader = BufReader::new(stdin);
-    let mut input = String::new();
-
-    loop {
-        print!("> ");
-        std::io::Write::flush(&mut std::io::stdout())?;
-
-        input.clear();
-        reader.read_line(&mut input).await?;
-        let input = input.trim();
-
-        if input.eq_ignore_ascii_case("exit") {
-            println!("Exiting client...");
-            break;
-        }
-
-        if input.is_empty() {
-            continue;
-        }
-
-        let parts: Vec<&str> = input.split_whitespace().collect();
-        if parts.is_empty() {
-            continue;
-        }
-
-        let state = state.lock().await;
-        let authenticated = state.authenticated;
-        let user_id = state.user_id;
-        drop(state);
-
-        let msg = match parts[0].to_lowercase().as_str() {
-            "register" if parts.len() >= 3 => {
-                let username = parts[1].to_string();
-                let public_key = parts[2..].join(" ");
-                ClientMessage::Register { username, public_key }
-            }
-            "login" if parts.len() >= 3 => {
-                let username = parts[1].to_string();
-                let public_key = parts[2..].join(" ");
-                ClientMessage::Login { username, public_key }
-            }
-            "send" if parts.len() >= 3 => {
-                if !authenticated {
-                    println!("Please login or register first");
-                    continue;
-                }
-                let receiver_username = parts[1].to_string();
-                let message_content = parts[2..].join(" ");
-                let plaintext = message_content.as_bytes();
-                let encrypted = crypto.encrypt(&key, plaintext)?;
-                ClientMessage::Send {
-                    receiver_username,
-                    message: Message {
-                        id: Uuid::new_v4(),
-                        sender_id: user_id.unwrap(),
-                        receiver_id: None,
-                        group_id: None,
-                        content: STANDARD.encode(encrypted),
-                        timestamp: chrono::Utc::now().timestamp(),
+            AppMessage::Connect => {
+                let addr = self.server_addr.clone();
+                let crypto = self.crypto.clone();
+                let writer = Arc::clone(&self.writer);
+                let reader = Arc::clone(&self.reader);
+                Command::perform(
+                    async move {
+                        let stream = TcpStream::connect(&addr).await?;
+                        let (read_half, write_half) = tokio::io::split(stream);
+                        let buf_reader = BufReader::new(read_half);
+                        *writer.lock().await = Some(write_half);
+                        *reader.lock().await = Some(buf_reader);
+                        Ok::<_, anyhow::Error>(())
                     },
-                }
-            }
-            "create_group" if parts.len() >= 3 => {
-                if !authenticated {
-                    println!("Please login or register first");
-                    continue;
-                }
-                let group_name = parts[1].to_string();
-                let member_usernames = parts[2..].iter().map(|s| s.to_string()).collect();
-                ClientMessage::CreateGroup { group_name, member_usernames }
-            }
-            "send_group" if parts.len() >= 3 => {
-                if !authenticated {
-                    println!("Please login or register first");
-                    continue;
-                }
-                let group_id = Uuid::parse_str(parts[1]).map_err(|e| {
-                    println!("Invalid group ID: {}", e);
-                    anyhow::anyhow!("Invalid group ID")
-                })?;
-                let message_content = parts[2..].join(" ");
-                let plaintext = message_content.as_bytes();
-                let encrypted = crypto.encrypt(&key, plaintext)?;
-                ClientMessage::SendToGroup {
-                    group_id,
-                    message: Message {
-                        id: Uuid::new_v4(),
-                        sender_id: user_id.unwrap(),
-                        receiver_id: None,
-                        group_id: Some(group_id),
-                        content: STANDARD.encode(encrypted),
-                        timestamp: chrono::Utc::now().timestamp(),
+                    |result| match result {
+                        Ok(()) => {
+                            AppMessage::ServerResponse(ServerResponse::Prompt(
+                                "Connected".to_string(),
+                            ))
+                        }
+                        Err(e) => AppMessage::Error(e.to_string()),
                     },
-                }
+                )
             }
-            "send_file" if parts.len() == 3 => {
-                if !authenticated {
-                    println!("Please login or register first");
-                    continue;
-                }
-                let receiver_username = parts[1].to_string();
-                let file_path = normalize_path(parts[2]); // Нормализуем путь
-                println!("Attempting to read file: {}", file_path);
-                let file_data = fs::read(&file_path).map_err(|e| {
-                    println!("Failed to read file: {}", e);
-                    anyhow::anyhow!("Failed to read file")
-                })?;
-                let encrypted = crypto.encrypt(&key, &file_data)?;
-                let filename = std::path::Path::new(&file_path)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                ClientMessage::SendFile {
-                    receiver_username,
-                    file: File {
-                        id: Uuid::new_v4(),
-                        sender_id: user_id.unwrap(),
-                        receiver_id: None, // Server will set
-                        group_id: None,
-                        filename,
-                        data: STANDARD.encode(encrypted),
-                        timestamp: chrono::Utc::now().timestamp(),
-                    },
-                }
-            },
-            "send_file_group" if parts.len() == 3 => {
-                if !authenticated {
-                    println!("Please login or register first");
-                    continue;
-                }
-                let group_id = Uuid::parse_str(parts[1]).map_err(|e| {
-                    println!("Invalid group ID: {}", e);
-                    anyhow::anyhow!("Invalid group ID")
-                })?;
-                let file_path = normalize_path(parts[2]);
-                println!("Attempting to read file: {}", file_path); // Для отладки
-                let file_data = fs::read(&file_path).map_err(|e| {
-                    println!("Failed to read file: {}", e);
-                    anyhow::anyhow!("Failed to read file")
-                })?;
-                let encrypted = crypto.encrypt(&key, &file_data)?;
-                let filename = std::path::Path::new(&file_path)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                ClientMessage::SendFileToGroup {
-                    group_id,
-                    file: File {
-                        id: Uuid::new_v4(),
-                        sender_id: user_id.unwrap(),
-                        receiver_id: None,
-                        group_id: Some(group_id),
-                        filename,
-                        data: STANDARD.encode(encrypted),
-                        timestamp: chrono::Utc::now().timestamp(),
-                    },
-                }
-            },
-            _ => {
-                println!("Unknown command. Use 'register <username> <public_key>', 'login <username> <public_key>', 'send <username> <message>', 'create_group <group_name> <username1> <username2> ...', 'send_group <group_id> <message>', 'send_file <username> <filepath>', or 'send_file_group <group_id> <filepath>'");
-                continue;
+            AppMessage::Error(error) => {
+                self.status = format!("Error: {}", error);
+                Command::none()
             }
-        };
-
-        let msg_json = serde_json::to_string(&msg)?;
-        // println!("Sending: {}", msg_json);
-        writer.write_all(msg_json.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
-
-        if matches!(msg, ClientMessage::Register { .. } | ClientMessage::Login { .. }) {
-            sleep(Duration::from_millis(100)).await;
         }
     }
 
-    Ok(())
+    fn view(&self) -> Element<AppMessage> {
+        match self.view {
+            View::Login => {
+                let username_input = text_input("Username", &self.username)
+                    .on_input(AppMessage::UsernameChanged)
+                    .padding(10)
+                    .width(Length::Fixed(300.0));
+
+                let public_key_input = text_input("Public Key", &self.public_key)
+                    .on_input(AppMessage::PublicKeyChanged)
+                    .padding(10)
+                    .width(Length::Fixed(300.0));
+
+                let register_button = button("Register")
+                    .on_press(AppMessage::Register)
+                    .padding(10);
+
+                let login_button = button("Login")
+                    .on_press(AppMessage::Login)
+                    .padding(10);
+
+                let status = text(&self.status).size(16);
+
+                container(
+                    column![
+                    text("Chat Application").size(30),
+                    username_input,
+                    public_key_input,
+                    row![register_button, login_button].spacing(10),
+                    status
+                ]
+                        .spacing(20)
+                        .align_items(Alignment::Center),
+                )
+                    .center_x()
+                    .center_y()
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
+            }
+            View::Chat => {
+                let message_display = scrollable(
+                    column(
+                        self.messages
+                            .iter()
+                            .map(|msg| text(msg).size(16).into())
+                            .collect::<Vec<_>>(),
+                    )
+                        .spacing(10)
+                        .padding(10),
+                )
+                    .height(Length::Fixed(300.0));
+
+                let receiver_input = text_input("Receiver Username", &self.receiver_username)
+                    .on_input(AppMessage::ReceiverUsernameChanged)
+                    .padding(10)
+                    .width(Length::Fixed(200.0));
+
+                let message_input = text_input("Message", &self.message_input)
+                    .on_input(AppMessage::MessageInputChanged)
+                    .padding(10)
+                    .width(Length::Fixed(200.0));
+
+                let send_message_button = button("Send Message")
+                    .on_press(AppMessage::SendMessage)
+                    .padding(10);
+
+                let group_name_input = text_input("Group Name", &self.group_name)
+                    .on_input(AppMessage::GroupNameChanged)
+                    .padding(10)
+                    .width(Length::Fixed(200.0));
+
+                let group_members_input = text_input(
+                    "Group Members (space-separated)",
+                    &self.group_members,
+                )
+                    .on_input(AppMessage::GroupMembersChanged)
+                    .padding(10)
+                    .width(Length::Fixed(200.0));
+
+                let create_group_button = button("Create Group")
+                    .on_press(AppMessage::CreateGroup)
+                    .padding(10);
+
+                let group_id_input = text_input("Group ID", &self.group_id)
+                    .on_input(AppMessage::GroupIdChanged)
+                    .padding(10)
+                    .width(Length::Fixed(200.0));
+
+                let group_message_input = text_input("Message", &self.message_input)
+                    .on_input(AppMessage::MessageInputChanged)
+                    .padding(10)
+                    .width(Length::Fixed(200.0));
+
+                let send_group_message_button = button("Send Group Message")
+                    .on_press(AppMessage::SendGroupMessage)
+                    .padding(10);
+
+                let file_path_input = text_input("File Path", &self.file_path)
+                    .on_input(AppMessage::FilePathChanged)
+                    .padding(10)
+                    .width(Length::Fixed(200.0));
+
+                let send_file_button = button("Send File")
+                    .on_press(AppMessage::SendFile)
+                    .padding(10);
+
+                let send_file_group_button = button("Send File to Group")
+                    .on_press(AppMessage::SendFileToGroup)
+                    .padding(10);
+
+                let status = text(&self.status).size(16);
+
+                container(
+                    column![
+                    text("Chat").size(30),
+                    message_display,
+                    row![receiver_input, message_input, send_message_button].spacing(10),
+                    row![group_name_input, group_members_input, create_group_button].spacing(10),
+                    row![group_id_input, group_message_input, send_group_message_button].spacing(10),
+                    row![file_path_input, send_file_button, send_file_group_button].spacing(10),
+                    status
+                ]
+                        .spacing(20)
+                        .align_items(Alignment::Center)
+                        .padding(20),
+                )
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x()
+                    .into()
+            }
+        }
+    }
+
+    fn subscription(&self) -> Subscription<AppMessage> {
+        struct ServerSubscription;
+
+        let reader = Arc::clone(&self.reader);
+        iced::subscription::unfold(
+            std::any::TypeId::of::<ServerSubscription>(),
+            reader.clone(), // Pass the Arc as initial state
+            move |reader_state| {
+                let reader = Arc::clone(&reader); // Clone Arc for async block
+                async move {
+                    let mut reader_guard = reader.lock().await;
+                    if let Some(reader) = reader_guard.as_mut() {
+                        let mut line = String::new();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) => (
+                                AppMessage::Error("Server disconnected".to_string()),
+                                reader_state, // Return the Arc
+                            ),
+                            Ok(_) => {
+                                if let Ok(response) = serde_json::from_str::<ServerResponse>(&line) {
+                                    (AppMessage::ServerResponse(response), reader_state)
+                                } else {
+                                    (
+                                        AppMessage::Error(format!("Invalid response: {}", line)),
+                                        reader_state,
+                                    )
+                                }
+                            }
+                            Err(e) => (
+                                AppMessage::Error(format!("Error reading: {}", e)),
+                                reader_state, // Keep reader even on error to retry
+                            ),
+                        }
+                    } else {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        (AppMessage::Error("No connection".to_string()), reader_state)
+                    }
+                }
+            },
+        )
+    }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let addr = env::args()
-        .nth(1)
-        .unwrap_or_else(|| env::var("SERVER_PORT").unwrap_or("127.0.0.1:8080".to_string()));
+async fn send_message(
+    writer: Arc<Mutex<Option<tokio::io::WriteHalf<TcpStream>>>>,
+    msg: ClientMessage,
+) -> Result<()> {
+    let mut writer_guard = writer.lock().await;
+    if let Some(writer) = writer_guard.as_mut() {
+        let msg_json = serde_json::to_string(&msg)?;
+        writer.write_all(msg_json.as_bytes()).await?;
+        writer.write_all(b"\n").await?;
+        writer.flush().await?;
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("Not connected to server"))
+    }
+}
 
-    run_client(&addr).await
+fn normalize_path(path: &str) -> String {
+    path.replace("\\\\", "/").replace("\\", "/")
+}
+
+fn main() -> iced::Result {
+    ChatApp::run(Settings::default())
 }
