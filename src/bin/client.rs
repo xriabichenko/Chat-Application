@@ -18,6 +18,8 @@ enum ClientMessage {
     Login { username: String, public_key: String },
     Text(Message),
     Send { receiver_username: String, message: Message },
+    CreateGroup { group_name: String, member_usernames: Vec<String> }, // Создание группы
+    SendToGroup { group_id: Uuid, message: Message },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -81,10 +83,15 @@ pub async fn run_client(addr: &str) -> Result<()> {
                                     .decode(&msg.content)
                                     .map_err(|e| anyhow::anyhow!("Base64 decode error: {}", e))?;
                                 let decrypted = crypto_clone.decrypt(&key, &decoded)?;
+                                let sender_info = if msg.group_id.is_some() {
+                                    format!("from group {}", msg.group_id.unwrap())
+                                } else {
+                                    format!("from sender_id: {}", msg.sender_id)
+                                };
                                 println!(
-                                    "Received message: {} (from sender_id: {})",
+                                    "Received message: {} ({})",
                                     String::from_utf8_lossy(&decrypted),
-                                    msg.sender_id
+                                    sender_info
                                 );
                             }
                         }
@@ -159,6 +166,39 @@ pub async fn run_client(addr: &str) -> Result<()> {
                         sender_id: user_id.unwrap(),
                         receiver_id: None, // Server will fill
                         group_id: None,
+                        content: STANDARD.encode(encrypted),
+                        timestamp: chrono::Utc::now().timestamp(),
+                    },
+                }
+            }
+            "create_group" if parts.len() >= 3 => {
+                if !authenticated {
+                    println!("Please login or register first");
+                    continue;
+                }
+                let group_name = parts[1].to_string();
+                let member_usernames = parts[2..].iter().map(|s| s.to_string()).collect();
+                ClientMessage::CreateGroup { group_name, member_usernames }
+            }
+            "send_group" if parts.len() >= 3 => {
+                if !authenticated {
+                    println!("Please login or register first");
+                    continue;
+                }
+                let group_id = Uuid::parse_str(parts[1]).map_err(|e| {
+                    println!("Invalid group ID: {}", e);
+                    anyhow::anyhow!("Invalid group ID")
+                })?;
+                let message_content = parts[2..].join(" ");
+                let plaintext = message_content.as_bytes();
+                let encrypted = crypto.encrypt(&key, plaintext)?;
+                ClientMessage::SendToGroup {
+                    group_id,
+                    message: Message {
+                        id: Uuid::new_v4(),
+                        sender_id: user_id.unwrap(),
+                        receiver_id: None,
+                        group_id: Some(group_id),
                         content: STANDARD.encode(encrypted),
                         timestamp: chrono::Utc::now().timestamp(),
                     },
