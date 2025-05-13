@@ -29,7 +29,9 @@ pub struct Group {
 pub struct File {
     pub id: Uuid,
     pub sender_id: Uuid,
+    pub receiver_id: Option<Uuid>,
     pub group_id: Option<Uuid>,
     pub filename: String,
-    pub data: Vec<u8>, // Encrypted
+    pub data: String, // Base64-encoded encrypted data
+    pub timestamp: i64,
 }
