@@ -31,11 +31,16 @@ enum ClientMessage {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 enum ServerResponse {
     Prompt(String),
-    SuccessLogin { message: String, user_id: Uuid },
-    SuccessMSG(String),
+    Success { message: String, data: Option<SuccessData> },
     Error(String),
     Message(Message),
     File(File),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+enum SuccessData {
+    Login { user_id: Uuid },
+    GroupCreated { group_id: Uuid },
 }
 
 #[derive(Default)]
@@ -400,15 +405,22 @@ impl Application for ChatApp {
                     ServerResponse::Prompt(msg) => {
                         self.status = msg;
                     }
-                    ServerResponse::SuccessLogin { message, user_id } => {
-                        self.status = format!("Success: {} (user_id: {})", message, user_id);
-                        let mut state = self.client_state.blocking_lock();
-                        state.authenticated = true;
-                        state.user_id = Some(user_id);
-                        self.view = View::Chat;
-                    }
-                    ServerResponse::SuccessMSG(message) => {
+                    ServerResponse::Success { message, data } => {
                         self.status = format!("Success: {}", message);
+                        if let Some(data) = data {
+                            match data {
+                                SuccessData::Login { user_id } => {
+                                    let mut state = self.client_state.blocking_lock();
+                                    state.authenticated = true;
+                                    state.user_id = Some(user_id);
+                                    self.view = View::Chat;
+                                }
+                                SuccessData::GroupCreated { group_id } => {
+                                    // Optionally handle group creation success (e.g., display group ID)
+                                    self.status = format!("{} (group_id: {})", self.status, group_id);
+                                }
+                            }
+                        }
                     }
                     ServerResponse::Error(msg) => {
                         self.status = format!("Error: {}", msg);
