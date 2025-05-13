@@ -88,6 +88,21 @@ impl Storage {
         Ok(user)
     }
 
+    pub fn get_all_users(&self) -> Result<Vec<User>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, username, public_key FROM users",
+        )?;
+        let user_iter = stmt.query_map([], |row| {
+            Ok(User {
+                id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap(),
+                username: row.get(1)?,
+                public_key: row.get(2)?,
+            })
+        })?;
+        let users = user_iter.collect::<Result<Vec<_>>>()?;
+        Ok(users)
+    }
+
     pub fn save_message(&self, msg: &Message) -> Result<()> {
         self.conn.execute(
             "INSERT INTO messages (id, sender_id, receiver_id, group_id, content, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -101,6 +116,56 @@ impl Storage {
             ),
         )?;
         Ok(())
+    }
+
+    pub fn get_messages_between_users(&self, user1: Uuid, user2: Uuid) -> Result<Vec<Message>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, sender_id, receiver_id, group_id, content, timestamp
+             FROM messages
+             WHERE (sender_id = ?1 AND receiver_id = ?2)
+                OR (sender_id = ?2 AND receiver_id = ?1)
+             ORDER BY timestamp",
+        )?;
+        let message_iter = stmt.query_map(
+            [&user1.to_string(), &user2.to_string()],
+            |row| {
+                Ok(Message {
+                    id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap(),
+                    sender_id: Uuid::parse_str(&row.get::<_, String>(1)?).unwrap(),
+                    receiver_id: row.get::<_, Option<String>>(2)?
+                        .map(|s| Uuid::parse_str(&s).unwrap()),
+                    group_id: row.get::<_, Option<String>>(3)?
+                        .map(|s| Uuid::parse_str(&s).unwrap()),
+                    content: row.get(4)?,
+                    timestamp: row.get(5)?,
+                })
+            },
+        )?;
+        let messages = message_iter.collect::<Result<Vec<_>>>()?;
+        Ok(messages)
+    }
+
+    pub fn get_messages_by_group_id(&self, group_id: Uuid) -> Result<Vec<Message>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, sender_id, receiver_id, group_id, content, timestamp
+             FROM messages
+             WHERE group_id = ?1
+             ORDER BY timestamp",
+        )?;
+        let message_iter = stmt.query_map([&group_id.to_string()], |row| {
+            Ok(Message {
+                id: Uuid::parse_str(&row.get::<_, String>(0)?).unwrap(),
+                sender_id: Uuid::parse_str(&row.get::<_, String>(1)?).unwrap(),
+                receiver_id: row.get::<_, Option<String>>(2)?
+                    .map(|s| Uuid::parse_str(&s).unwrap()),
+                group_id: row.get::<_, Option<String>>(3)?
+                    .map(|s| Uuid::parse_str(&s).unwrap()),
+                content: row.get(4)?,
+                timestamp: row.get(5)?,
+            })
+        })?;
+        let messages = message_iter.collect::<Result<Vec<_>>>()?;
+        Ok(messages)
     }
 
     pub fn save_group(&self, group: &Group) -> Result<()> {
@@ -134,6 +199,36 @@ impl Storage {
             name: group_info.1,
             members,
         })
+    }
+
+    pub fn get_groups_by_user_id(&self, user_id: Uuid) -> Result<Vec<Group>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT g.id, g.name
+             FROM groups g
+             JOIN group_members gm ON g.id = gm.group_id
+             WHERE gm.user_id = ?1",
+        )?;
+        let group_iter = stmt.query_map([&user_id.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut groups = Vec::new();
+        for group_info in group_iter {
+            let (id_str, name) = group_info?;
+            let group_id = Uuid::parse_str(&id_str).unwrap();
+            let mut stmt = self.conn.prepare(
+                "SELECT user_id FROM group_members WHERE group_id = ?1",
+            )?;
+            let member_rows = stmt.query_map([&group_id.to_string()], |row| {
+                Ok(Uuid::parse_str(&row.get::<_, String>(0)?).unwrap())
+            })?;
+            let members: Vec<Uuid> = member_rows.collect::<Result<Vec<_>>>()?;
+            groups.push(Group {
+                id: group_id,
+                name,
+                members,
+            });
+        }
+        Ok(groups)
     }
 
     pub fn add_user_to_group(&self, group_id: &Uuid, user_id: &Uuid) -> Result<()> {

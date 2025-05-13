@@ -1,6 +1,6 @@
 use iced::{
-    widget::{button, column, row, text, text_input, container, scrollable},
-    Alignment, Element, Length, Application, Command, Settings, Theme, Subscription,
+    widget::{button, column, row, text, text_input, container, scrollable, Button},
+    Alignment, Element, Length, Application, Command, Settings, Theme, Subscription, Color,Background,
 };
 use tokio::net::TcpStream;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -26,6 +26,9 @@ enum ClientMessage {
     SendToGroup { group_id: Uuid, message: Message },
     SendFile { receiver_username: String, file: File },
     SendFileToGroup { group_id: Uuid, file: File },
+    FetchUsers,
+    FetchGroups,
+    FetchMessages { target: ChatTarget },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -35,12 +38,33 @@ enum ServerResponse {
     Error(String),
     Message(Message),
     File(File),
+    Users(Vec<User>),
+    Groups(Vec<Group>),
+    Messages(Vec<Message>),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 enum SuccessData {
     Login { user_id: Uuid },
     GroupCreated { group_id: Uuid },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct User {
+    id: Uuid,
+    username: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct Group {
+    id: Uuid,
+    name: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+enum ChatTarget {
+    User(Uuid),
+    Group(Uuid),
 }
 
 #[derive(Default)]
@@ -59,7 +83,7 @@ struct ChatApp {
     group_id: String,
     message_input: String,
     file_path: String,
-    messages: Vec<String>,
+    messages: Vec<Message>,
     status: String,
     client_state: Arc<Mutex<ClientState>>,
     writer: Arc<Mutex<Option<tokio::io::WriteHalf<TcpStream>>>>,
@@ -67,12 +91,16 @@ struct ChatApp {
     crypto: Crypto,
     key: [u8; 32],
     view: View,
+    users: Vec<User>,
+    groups: Vec<Group>,
+    current_chat: Option<ChatTarget>,
 }
 
 #[derive(Default, Clone, PartialEq)]
 enum View {
     #[default]
     Login,
+    Main,
     Chat,
 }
 
@@ -96,6 +124,10 @@ enum AppMessage {
     ServerResponse(ServerResponse),
     Connect,
     Error(String),
+    FetchUsers,
+    FetchGroups,
+    SelectChat(ChatTarget),
+    BackToMain,
 }
 
 impl Application for ChatApp {
@@ -124,6 +156,9 @@ impl Application for ChatApp {
                 crypto: Crypto::new(),
                 key: [0u8; 32],
                 view: View::Login,
+                users: vec![],
+                groups: vec![],
+                current_chat: None,
             },
             Command::perform(async { AppMessage::Connect }, |msg| msg),
         )
@@ -194,15 +229,19 @@ impl Application for ChatApp {
                     username: self.username.clone(),
                     public_key: self.public_key.clone(),
                 };
-                self.view = View::Chat;
+                self.view = View::Main;
                 let writer = Arc::clone(&self.writer);
-                Command::perform(
-                    async move { send_message(writer, msg).await },
-                    |result| match result {
-                        Ok(()) => AppMessage::Error("Expected unit message".to_string()),
-                        Err(e) => AppMessage::Error(e.to_string()),
-                    },
-                )
+                Command::batch(vec![
+                    Command::perform(
+                        async move { send_message(writer, msg).await },
+                        |result| match result {
+                            Ok(()) => AppMessage::Error("Expected unit message".to_string()),
+                            Err(e) => AppMessage::Error(e.to_string()),
+                        },
+                    ),
+                    Command::perform(async { AppMessage::FetchUsers }, |msg| msg),
+                    Command::perform(async { AppMessage::FetchGroups }, |msg| msg),
+                ])
             }
             AppMessage::SendMessage => {
                 if !self.client_state.blocking_lock().authenticated {
@@ -400,6 +439,44 @@ impl Application for ChatApp {
                     },
                 )
             }
+            AppMessage::FetchUsers => {
+                let writer = Arc::clone(&self.writer);
+                Command::perform(
+                    async move { send_message(writer, ClientMessage::FetchUsers).await },
+                    |result| match result {
+                        Ok(()) => AppMessage::Error("Expected unit message".to_string()),
+                        Err(e) => AppMessage::Error(e.to_string()),
+                    },
+                )
+            }
+            AppMessage::FetchGroups => {
+                let writer = Arc::clone(&self.writer);
+                Command::perform(
+                    async move { send_message(writer, ClientMessage::FetchGroups).await },
+                    |result| match result {
+                        Ok(()) => AppMessage::Error("Expected unit message".to_string()),
+                        Err(e) => AppMessage::Error(e.to_string()),
+                    },
+                )
+            }
+            AppMessage::SelectChat(target) => {
+                self.current_chat = Some(target.clone());
+                self.view = View::Chat;
+                let writer = Arc::clone(&self.writer);
+                Command::perform(
+                    async move { send_message(writer, ClientMessage::FetchMessages { target }).await },
+                    |result| match result {
+                        Ok(()) => AppMessage::Error("Expected unit message".to_string()),
+                        Err(e) => AppMessage::Error(e.to_string()),
+                    },
+                )
+            }
+            AppMessage::BackToMain => {
+                self.view = View::Main;
+                self.current_chat = None;
+                self.messages.clear();
+                Command::none()
+            }
             AppMessage::ServerResponse(response) => {
                 match response {
                     ServerResponse::Prompt(msg) => {
@@ -413,11 +490,11 @@ impl Application for ChatApp {
                                     let mut state = self.client_state.blocking_lock();
                                     state.authenticated = true;
                                     state.user_id = Some(user_id);
-                                    self.view = View::Chat;
+                                    self.view = View::Main;
                                 }
                                 SuccessData::GroupCreated { group_id } => {
-                                    // Optionally handle group creation success (e.g., display group ID)
                                     self.status = format!("{} (group_id: {})", self.status, group_id);
+                                    return Command::perform(async { AppMessage::FetchGroups }, |msg| msg);
                                 }
                             }
                         }
@@ -440,20 +517,9 @@ impl Application for ChatApp {
                                 return Command::none();
                             }
                         };
-                        let sender_info = if msg.group_id.is_some() {
-                            format!("from group {}", msg.group_id.unwrap())
-                        } else {
-                            format!("from sender_id: {}", msg.sender_id)
-                        };
-                        let timestamp: DateTime<Utc> = DateTime::from_timestamp(msg.timestamp, 0)
-                            .unwrap_or_default();
-                        let display = format!(
-                            "[{}] {}: {}",
-                            timestamp.to_rfc3339(),
-                            sender_info,
-                            String::from_utf8_lossy(&decrypted)
-                        );
-                        self.messages.push(display);
+                        let mut msg = msg.clone();
+                        msg.content = String::from_utf8_lossy(&decrypted).to_string();
+                        self.messages.push(msg);
                     }
                     ServerResponse::File(file) => {
                         let decoded = match STANDARD.decode(&file.data) {
@@ -493,14 +559,44 @@ impl Application for ChatApp {
                             file.filename,
                             output_path
                         );
-                        self.messages.push(display);
+                        let message = Message {
+                            id: Uuid::new_v4(),
+                            sender_id: file.sender_id,
+                            receiver_id: file.receiver_id,
+                            group_id: file.group_id,
+                            content: display,
+                            timestamp: file.timestamp,
+                        };
+                        self.messages.push(message);
+                    }
+                    ServerResponse::Users(users) => {
+                        self.users = users;
+                    }
+                    ServerResponse::Groups(groups) => {
+                        self.groups = groups;
+                    }
+                    ServerResponse::Messages(messages) => {
+                        self.messages = messages
+                            .into_iter()
+                            .map(|mut msg| {
+                                let decoded = match STANDARD.decode(&msg.content) {
+                                    Ok(data) => data,
+                                    Err(_) => return msg,
+                                };
+                                let decrypted = match self.crypto.decrypt(&self.key, &decoded) {
+                                    Ok(data) => data,
+                                    Err(_) => return msg,
+                                };
+                                msg.content = String::from_utf8_lossy(&decrypted).to_string();
+                                msg
+                            })
+                            .collect();
                     }
                 }
                 Command::none()
             }
             AppMessage::Connect => {
                 let addr = self.server_addr.clone();
-                let crypto = self.crypto.clone();
                 let writer = Arc::clone(&self.writer);
                 let reader = Arc::clone(&self.reader);
                 Command::perform(
@@ -536,7 +632,6 @@ impl Application for ChatApp {
                     .on_input(AppMessage::UsernameChanged)
                     .padding(10)
                     .width(Length::Fixed(300.0));
-
                 let public_key_input = text_input("Public Key", &self.public_key)
                     .on_input(AppMessage::PublicKeyChanged)
                     .padding(10)
@@ -554,12 +649,12 @@ impl Application for ChatApp {
 
                 container(
                     column![
-                    text("Chat Application").size(30),
-                    username_input,
-                    public_key_input,
-                    row![register_button, login_button].spacing(10),
-                    status
-                ]
+                        text("Chat Application").size(30),
+                        username_input,
+                        public_key_input,
+                        row![register_button, login_button].spacing(10),
+                        status
+                    ]
                         .spacing(20)
                         .align_items(Alignment::Center),
                 )
@@ -569,93 +664,172 @@ impl Application for ChatApp {
                     .height(Length::Fill)
                     .into()
             }
-            View::Chat => {
-                let message_display = scrollable(
-                    column(
-                        self.messages
-                            .iter()
-                            .map(|msg| text(msg).size(16).into())
-                            .collect::<Vec<_>>(),
-                    )
+            View::Main => {
+                let sidebar = scrollable(
+                    column![
+                        text("Users").size(20),
+                        column(
+                            self.users
+                                .iter()
+                                .filter(|user| {
+                                    self.client_state
+                                        .blocking_lock()
+                                        .user_id
+                                        .map_or(true, |self_id| self_id != user.id)
+                                })
+                                .map(|user| {
+                                    Button::new(text(&user.username).size(16))
+                                        .on_press(AppMessage::SelectChat(ChatTarget::User(user.id)))
+                                        .padding(5)
+                                        .width(Length::Fill)
+                                        .into()
+                                })
+                                .collect::<Vec<_>>()
+                        )
+                        .spacing(5),
+                        text("Groups").size(20),
+                        column(
+                            self.groups
+                                .iter()
+                                .map(|group| {
+                                    Button::new(text(&group.name).size(16))
+                                        .on_press(AppMessage::SelectChat(ChatTarget::Group(group.id)))
+                                        .padding(5)
+                                        .width(Length::Fill)
+                                        .into()
+                                })
+                                .collect::<Vec<_>>()
+                        )
+                        .spacing(5),
+                    ]
                         .spacing(10)
                         .padding(10),
                 )
-                    .height(Length::Fixed(300.0));
-
-                let receiver_input = text_input("Receiver Username", &self.receiver_username)
-                    .on_input(AppMessage::ReceiverUsernameChanged)
-                    .padding(10)
                     .width(Length::Fixed(200.0));
 
-                let message_input = text_input("Message", &self.message_input)
-                    .on_input(AppMessage::MessageInputChanged)
-                    .padding(10)
-                    .width(Length::Fixed(200.0));
+                let chat_area = column![text("Select a user or group to start chatting").size(20)];
 
-                let send_message_button = button("Send Message")
-                    .on_press(AppMessage::SendMessage)
-                    .padding(10);
-
-                let group_name_input = text_input("Group Name", &self.group_name)
-                    .on_input(AppMessage::GroupNameChanged)
-                    .padding(10)
-                    .width(Length::Fixed(200.0));
-
-                let group_members_input = text_input(
-                    "Group Members (space-separated)",
-                    &self.group_members,
-                )
-                    .on_input(AppMessage::GroupMembersChanged)
-                    .padding(10)
-                    .width(Length::Fixed(200.0));
-
-                let create_group_button = button("Create Group")
-                    .on_press(AppMessage::CreateGroup)
-                    .padding(10);
-
-                let group_id_input = text_input("Group ID", &self.group_id)
-                    .on_input(AppMessage::GroupIdChanged)
-                    .padding(10)
-                    .width(Length::Fixed(200.0));
-
-                let group_message_input = text_input("Message", &self.message_input)
-                    .on_input(AppMessage::MessageInputChanged)
-                    .padding(10)
-                    .width(Length::Fixed(200.0));
-
-                let send_group_message_button = button("Send Group Message")
-                    .on_press(AppMessage::SendGroupMessage)
-                    .padding(10);
-
-                let file_path_input = text_input("File Path", &self.file_path)
-                    .on_input(AppMessage::FilePathChanged)
-                    .padding(10)
-                    .width(Length::Fixed(200.0));
-
-                let send_file_button = button("Send File")
-                    .on_press(AppMessage::SendFile)
-                    .padding(10);
-
-                let send_file_group_button = button("Send File to Group")
-                    .on_press(AppMessage::SendFileToGroup)
-                    .padding(10);
+                let group_creation = column![
+                    text("Create Group").size(20),
+                    text_input("Group Name", &self.group_name)
+                        .on_input(AppMessage::GroupNameChanged)
+                        .padding(10)
+                        .width(Length::Fixed(200.0)),
+                    text_input("Group Members (space-separated)", &self.group_members)
+                        .on_input(AppMessage::GroupMembersChanged)
+                        .padding(10)
+                        .width(Length::Fixed(200.0)),
+                    button("Create Group")
+                        .on_press(AppMessage::CreateGroup)
+                        .padding(10),
+                ]
+                    .spacing(10);
 
                 let status = text(&self.status).size(16);
 
                 container(
                     column![
-                    text("Chat").size(30),
-                    message_display,
-                    row![receiver_input, message_input, send_message_button].spacing(10),
-                    row![group_name_input, group_members_input, create_group_button].spacing(10),
-                    row![group_id_input, group_message_input, send_group_message_button].spacing(10),
-                    row![file_path_input, send_file_button, send_file_group_button].spacing(10),
-                    status
-                ]
+                        text("Main").size(30),
+                        row![
+                            sidebar,
+                            container(chat_area).padding(20).center_x().center_y(),
+                            container(group_creation).padding(20)
+                        ]
+                        .spacing(20),
+                        status
+                    ]
                         .spacing(20)
                         .align_items(Alignment::Center)
                         .padding(20),
                 )
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .center_x()
+                    .into()
+            }
+            View::Chat => {
+                let back_button = button("Back to Main")
+                    .on_press(AppMessage::BackToMain)
+                    .padding(10);
+
+                let message_display = scrollable(
+                    column(
+                        self.messages
+                            .iter()
+                            .map(|msg| {
+                                let timestamp: DateTime<Utc> =
+                                    DateTime::from_timestamp(msg.timestamp, 0)
+                                        .unwrap_or_default();
+                                let sender_info = if msg.group_id.is_some() {
+                                    format!("Group {}", msg.group_id.unwrap())
+                                } else {
+                                    format!("User {}", msg.sender_id)
+                                };
+                                text(format!(
+                                    "[{}] {}: {}",
+                                    timestamp.to_rfc3339(),
+                                    sender_info,
+                                    msg.content
+                                ))
+                                    .size(16)
+                                    .into()
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                        .spacing(10)
+                        .padding(10),
+                )
+                    .height(Length::Fixed(400.0));
+
+                let message_input = text_input("Message", &self.message_input)
+                    .on_input(AppMessage::MessageInputChanged)
+                    .padding(10)
+                    .width(Length::Fixed(400.0));
+
+                let send_button = match self.current_chat {
+                    Some(ChatTarget::User(_)) => button("Send Message")
+                        .on_press(AppMessage::SendMessage)
+                        .padding(10),
+                    Some(ChatTarget::Group(_)) => button("Send Group Message")
+                        .on_press(AppMessage::SendGroupMessage)
+                        .padding(10),
+                    None => button("Send Message").padding(10), // Disabled case
+                };
+
+                let file_path_input = text_input("File Path", &self.file_path)
+                    .on_input(AppMessage::FilePathChanged)
+                    .padding(10)
+                    .width(Length::Fixed(400.0));
+
+                let send_file_button = match self.current_chat {
+                    Some(ChatTarget::User(_)) => button("Send File")
+                        .on_press(AppMessage::SendFile)
+                        .padding(10),
+                    Some(ChatTarget::Group(_)) => button("Send File to Group")
+                        .on_press(AppMessage::SendFileToGroup)
+                        .padding(10),
+                    None => button("Send File").padding(10), // Disabled case
+                };
+
+                let status = text(&self.status).size(16);
+
+                container(
+                    column![
+            back_button,
+            text("Chat").size(30),
+            message_display,
+            row![message_input, send_button].spacing(10),
+            row![file_path_input, send_file_button].spacing(10),
+            status
+        ]
+                        .spacing(20)
+                        .align_items(Alignment::Center)
+                        .padding(20),
+                )
+                    .style(|_theme: &Theme| container::Appearance {
+                        background: Some(Background::Color(Color::from_rgb(0.8, 0.8, 0.8))), // Light gray
+                        ..Default::default()
+                    })
                     .width(Length::Fill)
                     .height(Length::Fill)
                     .center_x()
@@ -670,9 +844,9 @@ impl Application for ChatApp {
         let reader = Arc::clone(&self.reader);
         iced::subscription::unfold(
             std::any::TypeId::of::<ServerSubscription>(),
-            reader.clone(), // Pass the Arc as initial state
+            reader.clone(),
             move |reader_state| {
-                let reader = Arc::clone(&reader); // Clone Arc for async block
+                let reader = Arc::clone(&reader);
                 async move {
                     let mut reader_guard = reader.lock().await;
                     if let Some(reader) = reader_guard.as_mut() {
@@ -680,7 +854,7 @@ impl Application for ChatApp {
                         match reader.read_line(&mut line).await {
                             Ok(0) => (
                                 AppMessage::Error("Server disconnected".to_string()),
-                                reader_state, // Return the Arc
+                                reader_state,
                             ),
                             Ok(_) => {
                                 if let Ok(response) = serde_json::from_str::<ServerResponse>(&line) {
@@ -694,7 +868,7 @@ impl Application for ChatApp {
                             }
                             Err(e) => (
                                 AppMessage::Error(format!("Error reading: {}", e)),
-                                reader_state, // Keep reader even on error to retry
+                                reader_state,
                             ),
                         }
                     } else {
