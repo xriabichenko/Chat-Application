@@ -19,16 +19,33 @@ enum ClientMessage {
     SendToGroup { group_id: Uuid, message: Message },
     SendFile { receiver_username: String, file: File },
     SendFileToGroup { group_id: Uuid, file: File },
+    FetchUsers,
+    FetchGroups,
+    FetchMessages { target: ChatTarget },
 }
 
 #[derive(Serialize, Deserialize)]
 enum ServerResponse {
     Prompt(String),
-    SuccessLogin { message: String, user_id: Uuid },
-    SuccessMSG(String),
+    Success { message: String, data: Option<SuccessData> },
     Error(String),
     Message(Message),
     File(File),
+    Users(Vec<User>),
+    Groups(Vec<Group>),
+    Messages(Vec<Message>),
+}
+
+#[derive(Serialize, Deserialize)]
+enum SuccessData {
+    Login { user_id: Uuid },
+    GroupCreated { group_id: Uuid },
+}
+
+#[derive(Serialize, Deserialize)]
+enum ChatTarget {
+    User(Uuid),
+    Group(Uuid),
 }
 
 pub struct Server {
@@ -77,7 +94,6 @@ async fn handle_client(
     tokio::spawn(async move {
         while let Some(response) = rx.recv().await {
             let response_json = serde_json::to_string(&response)?;
-            // println!("Sending to client: {}", response_json);
             socket_write.write_all(response_json.as_bytes()).await?;
             socket_write.write_all(b"\n").await?;
             socket_write.flush().await?;
@@ -86,7 +102,7 @@ async fn handle_client(
     });
 
     tx.send(ServerResponse::Prompt(
-        "Please send 'login <username> <public_key>', 'register <username> <public_key>', 'send <username> <message>', 'create_group <group_name> <username1> <username2> ...', 'send_group <group_id> <message>', 'send_file <username> <filename>', or 'send_file_group <group_id> <filename>'".to_string(),
+        "Please send 'login <username> <public_key>', 'register <username> <public_key>', 'send <username> <message>', 'create_group <group_name> <username1> <username2> ...', 'send_group <group_id> <message>', 'send_file <username> <filename>', 'send_file_group <group_id> <filename>', 'fetch_users', 'fetch_groups', or 'fetch_messages <target>'".to_string(),
     ))
         .await?;
 
@@ -121,9 +137,9 @@ async fn handle_client(
                                     authenticated = true;
                                     let mut clients = clients.lock().await;
                                     clients.insert(user.id, tx.clone());
-                                    tx.send(ServerResponse::SuccessLogin {
+                                    tx.send(ServerResponse::Success {
                                         message: format!("Registered and logged in as {}", username),
-                                        user_id: user.id,
+                                        data: Some(SuccessData::Login { user_id: user.id }),
                                     })
                                         .await?;
                                 }
@@ -144,11 +160,11 @@ async fn handle_client(
                                     authenticated = true;
                                     let mut clients = clients.lock().await;
                                     clients.insert(user.id, tx.clone());
-                                    let response = ServerResponse::SuccessLogin {
+                                    tx.send(ServerResponse::Success {
                                         message: format!("Logged in as {}", username),
-                                        user_id: user.id,
-                                    };
-                                    tx.send(response).await?;
+                                        data: Some(SuccessData::Login { user_id: user.id }),
+                                    })
+                                        .await?;
                                 }
                                 Ok(_) => {
                                     tx.send(ServerResponse::Error(
@@ -206,9 +222,10 @@ async fn handle_client(
                                         receiver_tx
                                             .send(ServerResponse::Message(message.clone()))
                                             .await?;
-                                        tx.send(ServerResponse::SuccessMSG (
-                                             format!("Success"),
-                                        ))
+                                        tx.send(ServerResponse::Success {
+                                            message: "Message sent".to_string(),
+                                            data: None,
+                                        })
                                             .await?;
                                     } else {
                                         tx.send(ServerResponse::Error(
@@ -247,9 +264,10 @@ async fn handle_client(
                                 members,
                             };
                             storage.save_group(&group)?;
-                            tx.send(ServerResponse::SuccessMSG (
-                                format!("Success"),
-                            )).await?;
+                            tx.send(ServerResponse::Success {
+                                message: format!("Group {} created", group.name),
+                                data: Some(SuccessData::GroupCreated { group_id: group.id }),
+                            }).await?;
                         }
                         ClientMessage::SendToGroup { group_id, mut message } => {
                             if !authenticated {
@@ -275,9 +293,10 @@ async fn handle_client(
                                             member_tx.send(ServerResponse::Message(message.clone())).await?;
                                         }
                                     }
-                                    tx.send(ServerResponse::SuccessMSG (
-                                        format!("Success"),
-                                    )).await?;
+                                    tx.send(ServerResponse::Success {
+                                        message: "Message sent to group".to_string(),
+                                        data: None,
+                                    }).await?;
                                 }
                                 Err(_) => {
                                     tx.send(ServerResponse::Error("Group not found".to_string())).await?;
@@ -303,9 +322,10 @@ async fn handle_client(
                                         receiver_tx
                                             .send(ServerResponse::File(file.clone()))
                                             .await?;
-                                        tx.send(ServerResponse::SuccessMSG (
-                                             format!("Success"),
-                                            ))
+                                        tx.send(ServerResponse::Success {
+                                            message: format!("File {} sent", file.filename),
+                                            data: None,
+                                        })
                                             .await?;
                                     } else {
                                         tx.send(ServerResponse::Error(
@@ -346,12 +366,66 @@ async fn handle_client(
                                             member_tx.send(ServerResponse::File(file.clone())).await?;
                                         }
                                     }
-                                    tx.send(ServerResponse::SuccessMSG (
-                                         format!("Success")
-                                    )).await?;
+                                    tx.send(ServerResponse::Success {
+                                        message: format!("File {} sent to group", file.filename),
+                                        data: None,
+                                    }).await?;
                                 }
                                 Err(_) => {
                                     tx.send(ServerResponse::Error("Group not found".to_string())).await?;
+                                }
+                            }
+                        }
+                        ClientMessage::FetchUsers => {
+                            if !authenticated {
+                                tx.send(ServerResponse::Error("Not authenticated".to_string())).await?;
+                                continue;
+                            }
+                            let storage = storage.lock().await;
+                            match storage.get_all_users() {
+                                Ok(users) => {
+                                    tx.send(ServerResponse::Users(users)).await?;
+                                }
+                                Err(e) => {
+                                    tx.send(ServerResponse::Error(format!("Failed to fetch users: {}", e))).await?;
+                                }
+                            }
+                        }
+                        ClientMessage::FetchGroups => {
+                            if !authenticated {
+                                tx.send(ServerResponse::Error("Not authenticated".to_string())).await?;
+                                continue;
+                            }
+                            let storage = storage.lock().await;
+                            match storage.get_groups_by_user_id(user_id.unwrap()) {
+                                Ok(groups) => {
+                                    tx.send(ServerResponse::Groups(groups)).await?;
+                                }
+                                Err(e) => {
+                                    tx.send(ServerResponse::Error(format!("Failed to fetch groups: {}", e))).await?;
+                                }
+                            }
+                        }
+                        ClientMessage::FetchMessages { target } => {
+                            if !authenticated {
+                                tx.send(ServerResponse::Error("Not authenticated".to_string())).await?;
+                                continue;
+                            }
+                            let storage = storage.lock().await;
+                            let messages = match target {
+                                ChatTarget::User(target_user_id) => {
+                                    storage.get_messages_between_users(target_user_id, user_id.unwrap())
+                                }
+                                ChatTarget::Group(group_id) => {
+                                    storage.get_messages_by_group_id(group_id)
+                                }
+                            };
+                            match messages {
+                                Ok(messages) => {
+                                    tx.send(ServerResponse::Messages(messages)).await?;
+                                }
+                                Err(e) => {
+                                    tx.send(ServerResponse::Error(format!("Failed to fetch messages: {}", e))).await?;
                                 }
                             }
                         }
