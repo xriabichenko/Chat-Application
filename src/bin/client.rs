@@ -281,16 +281,16 @@ pub async fn run_client(addr:  &str) -> Result<()> {
                     println!("Invalid group ID: {}", e);
                     anyhow::anyhow!("Invalid group ID")
                 })?;
-                let file_path = parts[2].to_string();
+                let file_path = normalize_path(parts[2]);
+                println!("Attempting to read file: {}", file_path); // Для отладки
                 let file_data = fs::read(&file_path).map_err(|e| {
                     println!("Failed to read file: {}", e);
                     anyhow::anyhow!("Failed to read file")
                 })?;
                 let encrypted = crypto.encrypt(&key, &file_data)?;
-                let filename = file_path
-                    .split('/')
-                    .last()
-                    .or_else(|| file_path.split('\\').last())
+                let filename = std::path::Path::new(&file_path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
                     .unwrap_or("unknown")
                     .to_string();
                 ClientMessage::SendFileToGroup {
@@ -305,7 +305,7 @@ pub async fn run_client(addr:  &str) -> Result<()> {
                         timestamp: chrono::Utc::now().timestamp(),
                     },
                 }
-            }
+            },
             _ => {
                 println!("Unknown command. Use 'register <username> <public_key>', 'login <username> <public_key>', 'send <username> <message>', 'create_group <group_name> <username1> <username2> ...', 'send_group <group_id> <message>', 'send_file <username> <filepath>', or 'send_file_group <group_id> <filepath>'");
                 continue;
