@@ -1,6 +1,8 @@
 use iced::{
     widget::{button, column, row, text, text_input, container, scrollable, Button},
+    alignment::Horizontal,
     Alignment, Element, Length, Application, Command, Settings, Theme, Subscription, Color,Background,
+    theme,
 };
 use tokio::net::TcpStream;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -12,7 +14,7 @@ use base64::Engine;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::fs;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Utc, Local, Duration};
 use chat_application::models::{Message, File};
 use chat_application::crypto::Crypto;
 
@@ -128,6 +130,7 @@ enum AppMessage {
     FetchGroups,
     SelectChat(ChatTarget),
     BackToMain,
+    Logout,
 }
 
 impl Application for ChatApp {
@@ -461,6 +464,16 @@ impl Application for ChatApp {
             }
             AppMessage::SelectChat(target) => {
                 self.current_chat = Some(target.clone());
+                // Set receiver_username for User chats
+                if let ChatTarget::User(user_id) = &target {
+                    self.receiver_username = self.users
+                        .iter()
+                        .find(|user| user.id == *user_id)
+                        .map(|user| user.username.clone())
+                        .unwrap_or_default();
+                } else {
+                    self.receiver_username.clear(); // Clear for group chats
+                }
                 self.view = View::Chat;
                 let writer = Arc::clone(&self.writer);
                 Command::perform(
@@ -475,6 +488,26 @@ impl Application for ChatApp {
                 self.view = View::Main;
                 self.current_chat = None;
                 self.messages.clear();
+                Command::none()
+            }
+            AppMessage::Logout => {
+                let mut state = self.client_state.blocking_lock();
+                state.authenticated = false;
+                state.user_id = None;
+                self.username.clear();
+                self.public_key.clear();
+                self.receiver_username.clear();
+                self.group_name.clear();
+                self.group_members.clear();
+                self.group_id.clear();
+                self.message_input.clear();
+                self.file_path.clear();
+                self.messages.clear();
+                self.users.clear();
+                self.groups.clear();
+                self.current_chat = None;
+                self.view = View::Login;
+                self.status = "Logged out".to_string();
                 Command::none()
             }
             AppMessage::ServerResponse(response) => {
@@ -631,11 +664,13 @@ impl Application for ChatApp {
                 let username_input = text_input("Username", &self.username)
                     .on_input(AppMessage::UsernameChanged)
                     .padding(10)
-                    .width(Length::Fixed(300.0));
+                    .width(Length::Fixed(300.0))
+                    .style(theme::TextInput::Default);
                 let public_key_input = text_input("Public Key", &self.public_key)
                     .on_input(AppMessage::PublicKeyChanged)
                     .padding(10)
-                    .width(Length::Fixed(300.0));
+                    .width(Length::Fixed(300.0))
+                    .style(theme::TextInput::Default);
 
                 let register_button = button("Register")
                     .on_press(AppMessage::Register)
@@ -649,12 +684,12 @@ impl Application for ChatApp {
 
                 container(
                     column![
-                        text("Chat Application").size(30),
-                        username_input,
-                        public_key_input,
-                        row![register_button, login_button].spacing(10),
-                        status
-                    ]
+                    text("Chat Application").size(30),
+                    username_input,
+                    public_key_input,
+                    row![register_button, login_button].spacing(10),
+                    status
+                ]
                         .spacing(20)
                         .align_items(Alignment::Center),
                 )
@@ -667,41 +702,41 @@ impl Application for ChatApp {
             View::Main => {
                 let sidebar = scrollable(
                     column![
-                        text("Users").size(20),
-                        column(
-                            self.users
-                                .iter()
-                                .filter(|user| {
-                                    self.client_state
-                                        .blocking_lock()
-                                        .user_id
-                                        .map_or(true, |self_id| self_id != user.id)
-                                })
-                                .map(|user| {
-                                    Button::new(text(&user.username).size(16))
-                                        .on_press(AppMessage::SelectChat(ChatTarget::User(user.id)))
-                                        .padding(5)
-                                        .width(Length::Fill)
-                                        .into()
-                                })
-                                .collect::<Vec<_>>()
-                        )
-                        .spacing(5),
-                        text("Groups").size(20),
-                        column(
-                            self.groups
-                                .iter()
-                                .map(|group| {
-                                    Button::new(text(&group.name).size(16))
-                                        .on_press(AppMessage::SelectChat(ChatTarget::Group(group.id)))
-                                        .padding(5)
-                                        .width(Length::Fill)
-                                        .into()
-                                })
-                                .collect::<Vec<_>>()
-                        )
-                        .spacing(5),
-                    ]
+                    text("Users").size(20),
+                    column(
+                        self.users
+                            .iter()
+                            .filter(|user| {
+                                self.client_state
+                                    .blocking_lock()
+                                    .user_id
+                                    .map_or(true, |self_id| self_id != user.id)
+                            })
+                            .map(|user| {
+                                Button::new(text(&user.username).size(16))
+                                    .on_press(AppMessage::SelectChat(ChatTarget::User(user.id)))
+                                    .padding(5)
+                                    .width(Length::Fill)
+                                    .into()
+                            })
+                            .collect::<Vec<_>>()
+                    )
+                    .spacing(5),
+                    text("Groups").size(20),
+                    column(
+                        self.groups
+                            .iter()
+                            .map(|group| {
+                                Button::new(text(&group.name).size(16))
+                                    .on_press(AppMessage::SelectChat(ChatTarget::Group(group.id)))
+                                    .padding(5)
+                                    .width(Length::Fill)
+                                    .into()
+                            })
+                            .collect::<Vec<_>>()
+                    )
+                    .spacing(5),
+                ]
                         .spacing(10)
                         .padding(10),
                 )
@@ -710,34 +745,43 @@ impl Application for ChatApp {
                 let chat_area = column![text("Select a user or group to start chatting").size(20)];
 
                 let group_creation = column![
-                    text("Create Group").size(20),
-                    text_input("Group Name", &self.group_name)
-                        .on_input(AppMessage::GroupNameChanged)
-                        .padding(10)
-                        .width(Length::Fixed(200.0)),
-                    text_input("Group Members (space-separated)", &self.group_members)
-                        .on_input(AppMessage::GroupMembersChanged)
-                        .padding(10)
-                        .width(Length::Fixed(200.0)),
-                    button("Create Group")
-                        .on_press(AppMessage::CreateGroup)
-                        .padding(10),
-                ]
+                text("Create Group").size(20),
+                text_input("Group Name", &self.group_name)
+                    .on_input(AppMessage::GroupNameChanged)
+                    .padding(10)
+                    .width(Length::Fixed(200.0))
+                    .style(theme::TextInput::Default),
+                text_input("Group Members (space-separated)", &self.group_members)
+                    .on_input(AppMessage::GroupMembersChanged)
+                    .padding(10)
+                    .width(Length::Fixed(200.0))
+                    .style(theme::TextInput::Default),
+                button("Create Group")
+                    .on_press(AppMessage::CreateGroup)
+                    .padding(10),
+            ]
                     .spacing(10);
 
                 let status = text(&self.status).size(16);
-
+                let logout_button = button("Logout")
+                    .on_press(AppMessage::Logout)
+                    .padding(10);
                 container(
                     column![
+                    row![
                         text("Main").size(30),
-                        row![
-                            sidebar,
-                            container(chat_area).padding(20).center_x().center_y(),
-                            container(group_creation).padding(20)
-                        ]
-                        .spacing(20),
-                        status
+                        logout_button
                     ]
+                    .spacing(20)
+                    .align_items(Alignment::Center),
+                    row![
+                        sidebar,
+                        container(chat_area).padding(20).center_x().center_y(),
+                        container(group_creation).padding(20)
+                    ]
+                    .spacing(20),
+                    status
+                ]
                         .spacing(20)
                         .align_items(Alignment::Center)
                         .padding(20),
@@ -752,6 +796,10 @@ impl Application for ChatApp {
                     .on_press(AppMessage::BackToMain)
                     .padding(10);
 
+                let logout_button = button("Logout")
+                    .on_press(AppMessage::Logout)
+                    .padding(10);
+
                 let message_display = scrollable(
                     column(
                         self.messages
@@ -760,31 +808,59 @@ impl Application for ChatApp {
                                 let timestamp: DateTime<Utc> =
                                     DateTime::from_timestamp(msg.timestamp, 0)
                                         .unwrap_or_default();
-                                let sender_info = if msg.group_id.is_some() {
-                                    format!("Group {}", msg.group_id.unwrap())
-                                } else {
-                                    format!("User {}", msg.sender_id)
-                                };
-                                text(format!(
-                                    "[{}] {}: {}",
-                                    timestamp.to_rfc3339(),
-                                    sender_info,
-                                    msg.content
-                                ))
-                                    .size(16)
+                                let is_sender = self.client_state
+                                    .blocking_lock()
+                                    .user_id
+                                    .map_or(false, |self_id| {
+                                        self_id == msg.sender_id
+                                    });
+
+                                // Create a row for content and timestamp
+                                let message_row = row![
+                                text(&msg.content).size(16),
+                                text(format_timestamp(msg.timestamp))
+                                    .size(12)
+                                    .style(Color::from_rgb(0.5, 0.5, 0.5)),
+                            ]
+                                    .spacing(5)
+                                    .align_items(Alignment::Center);
+
+                                // Wrap in a container for styling and alignment
+                                container(message_row)
+                                    .padding(10)
+                                    .width(Length::Shrink)
+                                    .max_width(400) // Limit message width like a chat bubble
+                                    .style(move |_theme: &Theme| container::Appearance {
+                                        background: Some(Background::Color(
+                                            if is_sender {
+                                                Color::from_rgb(0.2, 0.6, 1.0) // Light blue for sent
+                                            } else {
+                                                Color::from_rgb(1.0, 1.0, 1.0) // White for received
+                                            }
+                                        )),
+                                        border: iced::Border {
+                                            color: Color::from_rgb(0.7, 0.7, 0.7),
+                                            width: 1.0,
+                                            radius: 8.0.into(),
+                                        },
+                                        ..Default::default()
+                                    })
+                                    .align_x(if is_sender { Horizontal::Right } else { Horizontal::Left })
                                     .into()
                             })
                             .collect::<Vec<_>>(),
                     )
                         .spacing(10)
-                        .padding(10),
+                        .padding(10)
+                        .width(Length::Fill), // Ensure full width for alignment
                 )
                     .height(Length::Fixed(400.0));
 
                 let message_input = text_input("Message", &self.message_input)
                     .on_input(AppMessage::MessageInputChanged)
                     .padding(10)
-                    .width(Length::Fixed(400.0));
+                    .width(Length::Fixed(400.0))
+                    .style(theme::TextInput::Default);
 
                 let send_button = match self.current_chat {
                     Some(ChatTarget::User(_)) => button("Send Message")
@@ -793,13 +869,16 @@ impl Application for ChatApp {
                     Some(ChatTarget::Group(_)) => button("Send Group Message")
                         .on_press(AppMessage::SendGroupMessage)
                         .padding(10),
-                    None => button("Send Message").padding(10), // Disabled case
+                    None => button("Send Message")
+                        .padding(10)
+                        .style(theme::Button::Secondary),
                 };
 
                 let file_path_input = text_input("File Path", &self.file_path)
                     .on_input(AppMessage::FilePathChanged)
                     .padding(10)
-                    .width(Length::Fixed(400.0));
+                    .width(Length::Fixed(400.0))
+                    .style(theme::TextInput::Default);
 
                 let send_file_button = match self.current_chat {
                     Some(ChatTarget::User(_)) => button("Send File")
@@ -808,20 +887,29 @@ impl Application for ChatApp {
                     Some(ChatTarget::Group(_)) => button("Send File to Group")
                         .on_press(AppMessage::SendFileToGroup)
                         .padding(10),
-                    None => button("Send File").padding(10), // Disabled case
+                    None => button("Send File")
+                        .padding(10)
+                        .style(theme::Button::Secondary),
                 };
 
                 let status = text(&self.status).size(16);
 
                 container(
                     column![
-            back_button,
-            text("Chat").size(30),
-            message_display,
-            row![message_input, send_button].spacing(10),
-            row![file_path_input, send_file_button].spacing(10),
-            status
-        ]
+                    row![back_button, logout_button].spacing(10),
+                    text(format!(
+                        "Chat: {}",
+                        if self.receiver_username.is_empty() {
+                            "Group or No User Selected"
+                        } else {
+                            &self.receiver_username
+                        }
+                    )).size(30),
+                    message_display,
+                    row![message_input, send_button].spacing(10),
+                    row![file_path_input, send_file_button].spacing(10),
+                    status
+                ]
                         .spacing(20)
                         .align_items(Alignment::Center)
                         .padding(20),
@@ -837,6 +925,7 @@ impl Application for ChatApp {
             }
         }
     }
+
 
     fn subscription(&self) -> Subscription<AppMessage> {
         struct ServerSubscription;
@@ -901,6 +990,24 @@ fn normalize_path(path: &str) -> String {
     path.replace("\\\\", "/").replace("\\", "/")
 }
 
+fn format_timestamp(timestamp: i64) -> String {
+    let datetime: DateTime<Utc> = DateTime::from_timestamp(timestamp, 0).unwrap_or_default();
+    let local_datetime: DateTime<Local> = datetime.with_timezone(&Local);
+    let now = Local::now();
+    let today = now.date_naive();
+    let message_date = local_datetime.date_naive();
+
+    if message_date == today {
+        // Today: show only time, e.g., "3:45 PM"
+        local_datetime.format("%I:%M %p").to_string()
+    } else if (today - message_date).num_days() == 1 {
+        // Yesterday: show "Yesterday, 3:45 PM"
+        format!("Yesterday, {}", local_datetime.format("%I:%M %p"))
+    } else {
+        // Older: show date and time, e.g., "May 13, 3:45 PM"
+        local_datetime.format("%b %d, %I:%M %p").to_string()
+    }
+}
 fn main() -> iced::Result {
     ChatApp::run(Settings::default())
 }
