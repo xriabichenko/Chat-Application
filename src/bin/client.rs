@@ -14,6 +14,7 @@ use base64::Engine;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::fs;
+use std::path::Path;
 use chrono::{DateTime, Utc, Local};
 use chat_application::models::{Message, File};
 use chat_application::crypto::Crypto;
@@ -607,9 +608,14 @@ impl Application for ChatApp {
                                 return Command::none();
                             }
                         };
-                        let output_path = format!("received_{}", file.filename);
+                        let output_dir = "chat_downloads";
+                        if let Err(e) = fs::create_dir_all(output_dir) {
+                            self.status = format!("Failed to create directory {}: {}", output_dir, e);
+                            return Command::none();
+                        }
+                        let output_path = format!("{}/received_{}", output_dir, file.filename);
                         if let Err(e) = fs::write(&output_path, decrypted) {
-                            self.status = format!("Failed to save file: {}", e);
+                            self.status = format!("Failed to save file to {}: {}", output_path, e);
                             return Command::none();
                         }
                         let sender_info = if file.group_id.is_some() {
