@@ -22,6 +22,9 @@ enum ClientMessage {
     FetchUsers,
     FetchGroups,
     FetchMessages { target: ChatTarget },
+    AddUserToGroup { group_id: Uuid, username: String },
+    RemoveUserFromGroup { group_id: Uuid, username: String },
+    DeleteGroup { group_id: Uuid },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -421,6 +424,163 @@ async fn handle_client(
                                     }
                                     tx.send(ServerResponse::Success {
                                         message: format!("File {} sent to group", file.filename),
+                                        data: None,
+                                    })
+                                        .await?;
+                                }
+                                Err(_) => {
+                                    tx.send(ServerResponse::Error("Group not found".to_string()))
+                                        .await?;
+                                }
+                            }
+                        }
+                        ClientMessage::AddUserToGroup { group_id, username } => {
+                            if !authenticated {
+                                tx.send(ServerResponse::Error("Not authenticated".to_string()))
+                                    .await?;
+                                continue;
+                            }
+                            let mut storage = storage.lock().await;
+                            match storage.get_group_by_id(&group_id) {
+                                Ok(group) => {
+                                    if !group.members.contains(&user_id.unwrap()) {
+                                        tx.send(ServerResponse::Error(
+                                            "You are not a member of this group".to_string(),
+                                        ))
+                                            .await?;
+                                        continue;
+                                    }
+                                    match storage.get_user_by_username(&username) {
+                                        Ok(user) => {
+                                            if group.members.contains(&user.id) {
+                                                tx.send(ServerResponse::Error(
+                                                    format!("User {} is already in the group", username),
+                                                ))
+                                                    .await?;
+                                                continue;
+                                            }
+                                            storage.add_user_to_group(&group_id, &user.id)?;
+                                            let clients = clients.lock().await;
+                                            if let Some(member_tx) = clients.get(&user.id) {
+                                                member_tx
+                                                    .send(ServerResponse::Prompt(format!(
+                                                        "Added to group {}",
+                                                        group.name
+                                                    )))
+                                                    .await?;
+                                            }
+                                            tx.send(ServerResponse::Success {
+                                                message: format!("User {} added to group", username),
+                                                data: None,
+                                            })
+                                                .await?;
+                                        }
+                                        Err(_) => {
+                                            tx.send(ServerResponse::Error(
+                                                format!("User {} not found", username),
+                                            ))
+                                                .await?;
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    tx.send(ServerResponse::Error("Group not found".to_string()))
+                                        .await?;
+                                }
+                            }
+                        }
+                        ClientMessage::RemoveUserFromGroup { group_id, username } => {
+                            if !authenticated {
+                                tx.send(ServerResponse::Error("Not authenticated".to_string()))
+                                    .await?;
+                                continue;
+                            }
+                            let mut storage = storage.lock().await;
+                            match storage.get_group_by_id(&group_id) {
+                                Ok(group) => {
+                                    if !group.members.contains(&user_id.unwrap()) {
+                                        tx.send(ServerResponse::Error(
+                                            "You are not a member of this group".to_string(),
+                                        ))
+                                            .await?;
+                                        continue;
+                                    }
+                                    match storage.get_user_by_username(&username) {
+                                        Ok(user) => {
+                                            if !group.members.contains(&user.id) {
+                                                tx.send(ServerResponse::Error(
+                                                    format!("User {} is not in the group", username),
+                                                ))
+                                                    .await?;
+                                                continue;
+                                            }
+                                            if user.id == user_id.unwrap() {
+                                                tx.send(ServerResponse::Error(
+                                                    "You cannot remove yourself from the group".to_string(),
+                                                ))
+                                                    .await?;
+                                                continue;
+                                            }
+                                            storage.remove_user_from_group(&group_id, &user.id)?;
+                                            let clients = clients.lock().await;
+                                            if let Some(member_tx) = clients.get(&user.id) {
+                                                member_tx
+                                                    .send(ServerResponse::Prompt(format!(
+                                                        "Removed from group {}",
+                                                        group.name
+                                                    )))
+                                                    .await?;
+                                            }
+                                            tx.send(ServerResponse::Success {
+                                                message: format!("User {} removed from group", username),
+                                                data: None,
+                                            })
+                                                .await?;
+                                        }
+                                        Err(_) => {
+                                            tx.send(ServerResponse::Error(
+                                                format!("User {} not found", username),
+                                            ))
+                                                .await?;
+                                        }
+                                    }
+                                }
+                                Err(_) => {
+                                    tx.send(ServerResponse::Error("Group not found".to_string()))
+                                        .await?;
+                                }
+                            }
+                        }
+                        ClientMessage::DeleteGroup { group_id } => {
+                            if !authenticated {
+                                tx.send(ServerResponse::Error("Not authenticated".to_string()))
+                                    .await?;
+                                continue;
+                            }
+                            let mut storage = storage.lock().await;
+                            match storage.get_group_by_id(&group_id) {
+                                Ok(group) => {
+                                    if !group.members.contains(&user_id.unwrap()) {
+                                        tx.send(ServerResponse::Error(
+                                            "You are not a member of this group".to_string(),
+                                        ))
+                                            .await?;
+                                        continue;
+                                    }
+                                    storage.delete_group(&group_id)?;
+                                    let clients = clients.lock().await;
+                                    for member_id in group.members {
+                                        if let Some(member_tx) = clients.get(&member_id) {
+                                            member_tx
+                                                .send(ServerResponse::Prompt(format!(
+                                                    "Group {} deleted",
+                                                    group.name
+                                                )))
+                                                .await?;
+                                        }
+                                    }
+                                    tx.send(ServerResponse::Success {
+                                        message: format!("Group {} deleted", group.name),
                                         data: None,
                                     })
                                         .await?;

@@ -32,6 +32,9 @@ enum ClientMessage {
     FetchUsers,
     FetchGroups,
     FetchMessages { target: ChatTarget },
+    AddUserToGroup { group_id: Uuid, username: String },
+    RemoveUserFromGroup { group_id: Uuid, username: String },
+    DeleteGroup { group_id: Uuid },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -97,6 +100,9 @@ struct ChatApp {
     users: Vec<User>,
     groups: Vec<Group>,
     current_chat: Option<ChatTarget>,
+    add_user_input: String,
+    remove_user_input: String,
+    scroll_id: scrollable::Id,
 }
 
 #[derive(Default, Clone, PartialEq)]
@@ -118,6 +124,8 @@ enum AppMessage {
     GroupIdChanged(String),
     MessageInputChanged(String),
     FilePathChanged(String),
+    AddUserInputChanged(String),
+    RemoveUserInputChanged(String),
     Register,
     Login,
     SendMessage,
@@ -125,6 +133,9 @@ enum AppMessage {
     SendGroupMessage,
     SendFile,
     SendFileToGroup,
+    AddUserToGroup,
+    RemoveUserFromGroup,
+    DeleteGroup,
     ServerResponse(ServerResponse),
     Connect,
     Error(String),
@@ -164,6 +175,9 @@ impl Application for ChatApp {
                 users: vec![],
                 groups: vec![],
                 current_chat: None,
+                add_user_input: String::new(),
+                remove_user_input: String::new(),
+                scroll_id: scrollable::Id::new("chat_scroll"),
             },
             Command::perform(async { AppMessage::Connect }, |msg| msg),
         )
@@ -205,6 +219,14 @@ impl Application for ChatApp {
             }
             AppMessage::FilePathChanged(file_path) => {
                 self.file_path = file_path;
+                Command::none()
+            }
+            AppMessage::AddUserInputChanged(username) => {
+                self.add_user_input = username;
+                Command::none()
+            }
+            AppMessage::RemoveUserInputChanged(username) => {
+                self.remove_user_input = username;
                 Command::none()
             }
             AppMessage::Register => {
@@ -280,6 +302,7 @@ impl Application for ChatApp {
                         async move { AppMessage::SelectChat(target) },
                         |msg| msg,
                     ),
+                    scrollable::snap_to(self.scroll_id.clone(), scrollable::RelativeOffset { x: 0.0, y: 1.0 }),
                 ])
             }
             AppMessage::CreateGroup => {
@@ -354,6 +377,7 @@ impl Application for ChatApp {
                         async move { AppMessage::SelectChat(target) },
                         |msg| msg,
                     ),
+                    scrollable::snap_to(self.scroll_id.clone(), scrollable::RelativeOffset { x: 0.0, y: 1.0 }),
                 ])
             }
             AppMessage::SendFile => {
@@ -406,6 +430,7 @@ impl Application for ChatApp {
                         async move { AppMessage::SelectChat(target) },
                         |msg| msg,
                     ),
+                    scrollable::snap_to(self.scroll_id.clone(), scrollable::RelativeOffset { x: 0.0, y: 1.0 }),
                 ])
             }
             AppMessage::SendFileToGroup => {
@@ -465,6 +490,99 @@ impl Application for ChatApp {
                         async move { AppMessage::SelectChat(target) },
                         |msg| msg,
                     ),
+                    scrollable::snap_to(self.scroll_id.clone(), scrollable::RelativeOffset { x: 0.0, y: 1.0 }),
+                ])
+            }
+            AppMessage::AddUserToGroup => {
+                if !self.client_state.blocking_lock().authenticated {
+                    self.status = "Please login first".to_string();
+                    return Command::none();
+                }
+                if self.group_id.is_empty() || self.add_user_input.is_empty() {
+                    self.status = "Group ID and username required".to_string();
+                    return Command::none();
+                }
+                let group_id = match Uuid::parse_str(&self.group_id) {
+                    Ok(id) => id,
+                    Err(_) => {
+                        self.status = "Invalid group ID".to_string();
+                        return Command::none();
+                    }
+                };
+                let msg = ClientMessage::AddUserToGroup {
+                    group_id,
+                    username: self.add_user_input.clone(),
+                };
+                self.add_user_input.clear();
+                let writer = Arc::clone(&self.writer);
+                Command::perform(
+                    async move { send_message(writer, msg).await },
+                    |result| match result {
+                        Ok(()) => AppMessage::ServerResponse(ServerResponse::Prompt("Add user request sent".to_string())),
+                        Err(e) => AppMessage::Error(e.to_string()),
+                    },
+                )
+            }
+            AppMessage::RemoveUserFromGroup => {
+                if !self.client_state.blocking_lock().authenticated {
+                    self.status = "Please login first".to_string();
+                    return Command::none();
+                }
+                if self.group_id.is_empty() || self.remove_user_input.is_empty() {
+                    self.status = "Group ID and username required".to_string();
+                    return Command::none();
+                }
+                let group_id = match Uuid::parse_str(&self.group_id) {
+                    Ok(id) => id,
+                    Err(_) => {
+                        self.status = "Invalid group ID".to_string();
+                        return Command::none();
+                    }
+                };
+                let msg = ClientMessage::RemoveUserFromGroup {
+                    group_id,
+                    username: self.remove_user_input.clone(),
+                };
+                self.remove_user_input.clear();
+                let writer = Arc::clone(&self.writer);
+                Command::perform(
+                    async move { send_message(writer, msg).await },
+                    |result| match result {
+                        Ok(()) => AppMessage::ServerResponse(ServerResponse::Prompt("Remove user request sent".to_string())),
+                        Err(e) => AppMessage::Error(e.to_string()),
+                    },
+                )
+            }
+            AppMessage::DeleteGroup => {
+                if !self.client_state.blocking_lock().authenticated {
+                    self.status = "Please login first".to_string();
+                    return Command::none();
+                }
+                if self.group_id.is_empty() {
+                    self.status = "Group ID required".to_string();
+                    return Command::none();
+                }
+                let group_id = match Uuid::parse_str(&self.group_id) {
+                    Ok(id) => id,
+                    Err(_) => {
+                        self.status = "Invalid group ID".to_string();
+                        return Command::none();
+                    }
+                };
+                let msg = ClientMessage::DeleteGroup { group_id };
+                let writer = Arc::clone(&self.writer);
+                Command::batch(vec![
+                    Command::perform(
+                        async move { send_message(writer, msg).await },
+                        |result| match result {
+                            Ok(()) => AppMessage::ServerResponse(ServerResponse::Prompt("Delete group request sent".to_string())),
+                            Err(e) => AppMessage::Error(e.to_string()),
+                        },
+                    ),
+                    Command::perform(
+                        async { AppMessage::BackToMain },
+                        |msg| msg,
+                    ),
                 ])
             }
             AppMessage::FetchUsers => {
@@ -506,13 +624,16 @@ impl Application for ChatApp {
                     self.view = View::GroupChat;
                 }
                 let writer = Arc::clone(&self.writer);
-                Command::perform(
-                    async move { send_message(writer, ClientMessage::FetchMessages { target }).await },
-                    |result| match result {
-                        Ok(()) => AppMessage::ServerResponse(ServerResponse::Prompt("Fetching messages".to_string())),
-                        Err(e) => AppMessage::Error(e.to_string()),
-                    },
-                )
+                Command::batch(vec![
+                    Command::perform(
+                        async move { send_message(writer, ClientMessage::FetchMessages { target }).await },
+                        |result| match result {
+                            Ok(()) => AppMessage::ServerResponse(ServerResponse::Prompt("Fetching messages".to_string())),
+                            Err(e) => AppMessage::Error(e.to_string()),
+                        },
+                    ),
+                    scrollable::snap_to(self.scroll_id.clone(), scrollable::RelativeOffset { x: 0.0, y: 1.0 }),
+                ])
             }
             AppMessage::BackToMain => {
                 self.view = View::Main;
@@ -520,6 +641,8 @@ impl Application for ChatApp {
                 self.messages.clear();
                 self.receiver_username.clear();
                 self.group_id.clear();
+                self.add_user_input.clear();
+                self.remove_user_input.clear();
                 Command::none()
             }
             AppMessage::Logout => {
@@ -538,6 +661,8 @@ impl Application for ChatApp {
                 self.users.clear();
                 self.groups.clear();
                 self.current_chat = None;
+                self.add_user_input.clear();
+                self.remove_user_input.clear();
                 self.view = View::Login;
                 self.status = "Logged out".to_string();
                 Command::none()
@@ -546,7 +671,7 @@ impl Application for ChatApp {
                 match response {
                     ServerResponse::Prompt(msg) => {
                         self.status = msg.clone();
-                        if msg.contains("Added to group") {
+                        if msg.contains("Added to group") || msg.contains("Group deleted") {
                             return Command::perform(async { AppMessage::FetchGroups }, |msg| msg);
                         }
                     }
@@ -592,6 +717,7 @@ impl Application for ChatApp {
                         let mut msg = msg.clone();
                         msg.content = String::from_utf8_lossy(&decrypted).to_string();
                         self.messages.push(msg);
+                        return scrollable::snap_to(self.scroll_id.clone(), scrollable::RelativeOffset { x: 0.0, y: 1.0 });
                     }
                     ServerResponse::File(file) => {
                         let decoded = match STANDARD.decode(&file.data) {
@@ -645,6 +771,7 @@ impl Application for ChatApp {
                             timestamp: file.timestamp,
                         };
                         self.messages.push(message);
+                        return scrollable::snap_to(self.scroll_id.clone(), scrollable::RelativeOffset { x: 0.0, y: 1.0 });
                     }
                     ServerResponse::Users(users) => {
                         self.users = users;
@@ -668,6 +795,7 @@ impl Application for ChatApp {
                                 msg
                             })
                             .collect();
+                        return scrollable::snap_to(self.scroll_id.clone(), scrollable::RelativeOffset { x: 0.0, y: 1.0 });
                     }
                 }
                 Command::none()
@@ -892,7 +1020,8 @@ impl Application for ChatApp {
                         .padding(10)
                         .width(Length::Fill),
                 )
-                    .height(Length::Fixed(400.0));
+                    .height(Length::Fixed(400.0))
+                    .id(self.scroll_id.clone());
 
                 let message_input = text_input("Message", &self.message_input)
                     .on_input(AppMessage::MessageInputChanged)
@@ -1007,7 +1136,8 @@ impl Application for ChatApp {
                         .padding(10)
                         .width(Length::Fill),
                 )
-                    .height(Length::Fixed(400.0));
+                    .height(Length::Fixed(400.0))
+                    .id(self.scroll_id.clone());
 
                 let message_input = text_input("Message", &self.message_input)
                     .on_input(AppMessage::MessageInputChanged)
@@ -1029,15 +1159,41 @@ impl Application for ChatApp {
                     .on_press(AppMessage::SendFileToGroup)
                     .padding(10);
 
+                let add_user_input = text_input("Add User (Username)", &self.add_user_input)
+                    .on_input(AppMessage::AddUserInputChanged)
+                    .padding(10)
+                    .width(Length::Fixed(400.0))
+                    .style(theme::TextInput::Default);
+
+                let add_user_button = button("Add User to Group")
+                    .on_press(AppMessage::AddUserToGroup)
+                    .padding(10);
+
+                let remove_user_input = text_input("Remove User (Username)", &self.remove_user_input)
+                    .on_input(AppMessage::RemoveUserInputChanged)
+                    .padding(10)
+                    .width(Length::Fixed(400.0))
+                    .style(theme::TextInput::Default);
+
+                let remove_user_button = button("Remove User from Group")
+                    .on_press(AppMessage::RemoveUserFromGroup)
+                    .padding(10);
+
+                let delete_group_button = button("Delete Group")
+                    .on_press(AppMessage::DeleteGroup)
+                    .padding(10);
+
                 let status = text(&self.status).size(16);
 
                 container(
                     column![
-                        row![back_button].spacing(10),
+                        row![back_button, delete_group_button].spacing(10),
                         text(format!("Group Chat: {}", group_name)).size(30),
                         message_display,
                         row![message_input, send_button].spacing(10),
                         row![file_path_input, send_file_button].spacing(10),
+                        row![add_user_input, add_user_button].spacing(10),
+                        row![remove_user_input, remove_user_button].spacing(10),
                         status
                     ]
                         .spacing(20)

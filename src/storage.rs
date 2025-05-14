@@ -209,12 +209,12 @@ impl Storage {
              WHERE gm.user_id = ?1",
         )?;
         let group_iter = stmt.query_map([&user_id.to_string()], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            let group_id = Uuid::parse_str(&row.get::<_, String>(0)?).unwrap();
+            Ok((group_id, row.get::<_, String>(1)?))
         })?;
         let mut groups = Vec::new();
         for group_info in group_iter {
-            let (id_str, name) = group_info?;
-            let group_id = Uuid::parse_str(&id_str).unwrap();
+            let (group_id, name) = group_info?;
             let mut stmt = self.conn.prepare(
                 "SELECT user_id FROM group_members WHERE group_id = ?1",
             )?;
@@ -231,14 +231,6 @@ impl Storage {
         Ok(groups)
     }
 
-    pub fn add_user_to_group(&self, group_id: &Uuid, user_id: &Uuid) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO group_members (group_id, user_id) VALUES (?1, ?2)",
-            (&group_id.to_string(), &user_id.to_string()),
-        )?;
-        Ok(())
-    }
-
     pub fn save_file(&self, file: &File) -> Result<()> {
         self.conn.execute(
             "INSERT INTO files (id, sender_id, receiver_id, group_id, filename, data, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -251,6 +243,46 @@ impl Storage {
                 &file.data,
                 &file.timestamp,
             ),
+        )?;
+        Ok(())
+    }
+
+    pub fn add_user_to_group(&self, group_id: &Uuid, user_id: &Uuid) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO group_members (group_id, user_id) VALUES (?1, ?2)",
+            (&group_id.to_string(), &user_id.to_string()),
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_user_from_group(&self, group_id: &Uuid, user_id: &Uuid) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM group_members WHERE group_id = ?1 AND user_id = ?2",
+            (&group_id.to_string(), &user_id.to_string()),
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_group(&self, group_id: &Uuid) -> Result<()> {
+        // Delete group members
+        self.conn.execute(
+            "DELETE FROM group_members WHERE group_id = ?1",
+            [&group_id.to_string()],
+        )?;
+        // Delete messages associated with the group
+        self.conn.execute(
+            "DELETE FROM messages WHERE group_id = ?1",
+            [&group_id.to_string()],
+        )?;
+        // Delete files associated with the group
+        self.conn.execute(
+            "DELETE FROM files WHERE group_id = ?1",
+            [&group_id.to_string()],
+        )?;
+        // Delete the group itself
+        self.conn.execute(
+            "DELETE FROM groups WHERE id = ?1",
+            [&group_id.to_string()],
         )?;
         Ok(())
     }
