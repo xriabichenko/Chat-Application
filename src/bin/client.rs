@@ -233,19 +233,14 @@ impl Application for ChatApp {
                     username: self.username.clone(),
                     public_key: self.public_key.clone(),
                 };
-                self.view = View::Main;
                 let writer = Arc::clone(&self.writer);
-                Command::batch(vec![
-                    Command::perform(
-                        async move { send_message(writer, msg).await },
-                        |result| match result {
-                            Ok(()) => AppMessage::ServerResponse(ServerResponse::Prompt("Login sent".to_string())),
-                            Err(e) => AppMessage::Error(e.to_string()),
-                        },
-                    ),
-                    Command::perform(async { AppMessage::FetchUsers }, |msg| msg),
-                    Command::perform(async { AppMessage::FetchGroups }, |msg| msg),
-                ])
+                Command::perform(
+                    async move { send_message(writer, msg).await },
+                    |result| match result {
+                        Ok(()) => AppMessage::ServerResponse(ServerResponse::Prompt("Login sent".to_string())),
+                        Err(e) => AppMessage::Error(e.to_string()),
+                    },
+                )
             }
             AppMessage::SendMessage => {
                 if !self.client_state.blocking_lock().authenticated {
@@ -549,7 +544,10 @@ impl Application for ChatApp {
             AppMessage::ServerResponse(response) => {
                 match response {
                     ServerResponse::Prompt(msg) => {
-                        self.status = msg;
+                        self.status = msg.clone();
+                        if msg.contains("Added to group") {
+                            return Command::perform(async { AppMessage::FetchGroups }, |msg| msg);
+                        }
                     }
                     ServerResponse::Success { message, data } => {
                         self.status = format!("Success: {}", message);
@@ -560,6 +558,10 @@ impl Application for ChatApp {
                                     state.authenticated = true;
                                     state.user_id = Some(user_id);
                                     self.view = View::Main;
+                                    return Command::batch(vec![
+                                        Command::perform(async { AppMessage::FetchUsers }, |msg| msg),
+                                        Command::perform(async { AppMessage::FetchGroups }, |msg| msg),
+                                    ]);
                                 }
                                 SuccessData::GroupCreated { group_id } => {
                                     self.status = format!("{} (group_id: {})", self.status, group_id);
@@ -804,9 +806,13 @@ impl Application for ChatApp {
                     .padding(10);
                 container(
                     column![
-                        row![text("Main").size(30), logout_button]
-                            .spacing(20)
-                            .align_items(Alignment::Center),
+                        column![
+                            text(format!("Logged in as: {}", self.username)).size(20),
+                            row![text("Main").size(30), logout_button]
+                                .spacing(20)
+                                .align_items(Alignment::Center),
+                        ]
+                        .spacing(10),
                         row![
                             sidebar,
                             container(chat_area).padding(20).center_x().center_y(),
@@ -827,10 +833,6 @@ impl Application for ChatApp {
             View::Chat => {
                 let back_button = button("Back to Main")
                     .on_press(AppMessage::BackToMain)
-                    .padding(10);
-
-                let logout_button = button("Logout")
-                    .on_press(AppMessage::Logout)
                     .padding(10);
 
                 let message_display = scrollable(
@@ -910,7 +912,7 @@ impl Application for ChatApp {
 
                 container(
                     column![
-                        row![back_button, logout_button].spacing(10),
+                        row![back_button].spacing(10),
                         text(format!("Chat: {}", self.receiver_username)).size(30),
                         message_display,
                         row![message_input, send_button].spacing(10),
@@ -933,10 +935,6 @@ impl Application for ChatApp {
             View::GroupChat => {
                 let back_button = button("Back to Main")
                     .on_press(AppMessage::BackToMain)
-                    .padding(10);
-
-                let logout_button = button("Logout")
-                    .on_press(AppMessage::Logout)
                     .padding(10);
 
                 let group_name = self
@@ -1029,7 +1027,7 @@ impl Application for ChatApp {
 
                 container(
                     column![
-                        row![back_button, logout_button].spacing(10),
+                        row![back_button].spacing(10),
                         text(format!("Group Chat: {}", group_name)).size(30),
                         message_display,
                         row![message_input, send_button].spacing(10),

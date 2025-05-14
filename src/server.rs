@@ -267,10 +267,23 @@ async fn handle_client(
                             }
                             let group = Group {
                                 id: Uuid::new_v4(),
-                                name: group_name,
+                                name: group_name.clone(),
                                 members,
                             };
                             storage.save_group(&group)?;
+                            let clients = clients.lock().await;
+                            for member_id in &group.members {
+                                if let Some(member_tx) = clients.get(member_id) {
+                                    if *member_id != user_id.unwrap() {
+                                        member_tx
+                                            .send(ServerResponse::Prompt(format!(
+                                                "Added to group {}",
+                                                group_name
+                                            )))
+                                            .await?;
+                                    }
+                                }
+                            }
                             tx.send(ServerResponse::Success {
                                 message: format!("Group {} created", group.name),
                                 data: Some(SuccessData::GroupCreated { group_id: group.id }),
